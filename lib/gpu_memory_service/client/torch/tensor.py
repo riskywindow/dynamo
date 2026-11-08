@@ -209,6 +209,8 @@ class GMSTensorSpec:
         specs: Dict[str, GMSTensorSpec] = {}
 
         for key in gms_client_memory_manager.metadata_list():
+            if key.startswith("__gms__."):
+                continue
             got = gms_client_memory_manager.metadata_get(key)
             if got is None:
                 raise RuntimeError(f"Metadata key disappeared: {key}")

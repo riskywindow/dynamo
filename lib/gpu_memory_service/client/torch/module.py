@@ -69,7 +69,7 @@ def _iter_module_tensors(
         | set(module._buffers.keys())
         | set(module._modules.keys())
     )
-    for attr_name in dir(module):
+    for attr_name in vars(module):
         if attr_name in skip or attr_name.startswith("__"):
             continue
         try:
@@ -220,12 +220,12 @@ def materialize_module_from_gms(
     # Check for meta tensors and warn
     meta_tensors = [n for n, p in model.named_parameters() if p.is_meta]
     meta_tensors += [n for n, b in model.named_buffers() if b.is_meta]
+    for module_name, child in model.named_modules():
+        for key, value in vars(child).items():
+            if isinstance(value, torch.Tensor) and value.is_meta:
+                meta_tensors.append(f"{module_name}.{key}")
     if meta_tensors:
-        logger.warning(
-            "[GMS] %d meta tensors not in metadata: %s",
-            len(meta_tensors),
-            meta_tensors[:10],
-        )
+        raise RuntimeError(f"GMS reconstruction left meta tensors: {meta_tensors[:10]}")
 
 
 def rebind_nonparameter_tensors(

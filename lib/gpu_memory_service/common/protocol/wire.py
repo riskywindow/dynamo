@@ -3,6 +3,7 @@
 
 """Wire protocol for length-prefixed messages with optional FD passing."""
 
+import array
 import asyncio
 import os
 import socket
@@ -53,21 +54,56 @@ async def send_message(writer, msg: Message, fd: int = -1) -> None:
         if transport_sock is None:
             raise RuntimeError("Cannot get socket from transport for FD passing")
 
-        def do_send_fd():
-            raw_fd = transport_sock.fileno()
-            dup_fd = os.dup(raw_fd)
-            try:
-                sock = socket.socket(fileno=dup_fd)
+        # Register writability on a private descriptor without changing the
+        # shared open-file-description flags of asyncio's transport socket.
+        loop = asyncio.get_running_loop()
+        dup_fd = os.dup(transport_sock.fileno())
+        sock = None
+        sent = 0
+        try:
+            sock = socket.socket(fileno=dup_fd)
+            while sent < len(frame):
                 try:
-                    sock.setblocking(True)
-                    socket.send_fds(sock, [frame], [fd])
-                finally:
-                    sock.detach()
-            except Exception:
-                os.close(dup_fd)
-                raise
+                    if sent == 0:
+                        # SCM_RIGHTS is attached once, to the initial bytes.
+                        count = sock.sendmsg(
+                            [frame],
+                            [
+                                (
+                                    socket.SOL_SOCKET,
+                                    socket.SCM_RIGHTS,
+                                    array.array("i", [fd]),
+                                )
+                            ],
+                            socket.MSG_DONTWAIT,
+                        )
+                    else:
+                        count = sock.send(frame[sent:], socket.MSG_DONTWAIT)
+                except (BlockingIOError, InterruptedError):
+                    writable = loop.create_future()
 
-        await asyncio.get_running_loop().run_in_executor(None, do_send_fd)
+                    def ready(writable=writable):
+                        if not writable.done():
+                            writable.set_result(None)
+
+                    loop.add_writer(dup_fd, ready)
+                    try:
+                        await writable
+                    finally:
+                        loop.remove_writer(dup_fd)
+                    continue
+                if count <= 0:
+                    raise ConnectionResetError("FD frame send made no progress")
+                sent += count
+        except BaseException:
+            if sent:
+                # A partial frame cannot be rolled back or safely reused.
+                writer.transport.abort()
+            raise
+        finally:
+            if sock is not None:
+                sock.detach()
+            os.close(dup_fd)
     else:
         writer.write(frame)
         await writer.drain()

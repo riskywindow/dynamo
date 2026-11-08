@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -29,6 +30,7 @@ class _TagState:
     socket_path: str
     device: int
     is_scratch: bool = False
+    callback_failure: Exception | None = None
 
 
 _tag_states: dict[str, _TagState] = {}
@@ -73,7 +75,13 @@ def _gms_free(ptr: int, size: int, device: int, stream: int) -> None:
         if va not in state.manager.mappings:
             continue
         logger.debug("[GMS] free(tag=%s): va=0x%x size=%d", tag, va, size)
-        state.manager.destroy_mapping(va)
+        try:
+            state.manager.destroy_mapping(va)
+        except Exception as exc:
+            # The native shim cannot propagate free callback exceptions.
+            # Preserve the failure for the publication barrier.
+            if state.callback_failure is None:
+                state.callback_failure = exc
         return
     logger.warning("[GMS] free: no manager owns va=0x%x, ignoring", va)
 
@@ -365,3 +373,34 @@ def gms_use_mem_pool(tag: str, device: "torch.device | int") -> Iterator[None]:
                 yield
     finally:
         _active_tag.reset(token)
+
+
+def release_gms_mem_pool(manager: "GMSClientMemoryManager") -> None:
+    """Release cached blocks through Torch's allocator, preserving live storage.
+
+    Called outside the pool region after synchronizing. Live StorageImpls keep
+    their backing while cached blocks are released. Module traversal cannot
+    establish allocation liveness.
+    """
+    state = _tag_states.get(manager.tag)
+    if state is None or state.manager is not manager or state.mem_pool is None:
+        raise RuntimeError("GMS weight pool is missing or already finalized")
+    if _active_tag.get() == manager.tag:
+        raise RuntimeError("Cannot finalize an active GMS memory pool")
+    gc.collect()
+    pool = state.mem_pool
+    state.mem_pool = None
+    del pool
+    gc.collect()
+    raise_if_gms_allocator_failed(manager)
+
+
+def raise_if_gms_allocator_failed(manager: "GMSClientMemoryManager") -> None:
+    """Surface native free-callback errors at synchronous ownership barriers."""
+    state = _tag_states.get(manager.tag)
+    if state is None or state.manager is not manager:
+        raise RuntimeError("GMS allocator state is missing")
+    if state.callback_failure is not None:
+        raise RuntimeError(
+            "GMS allocator free callback failed"
+        ) from state.callback_failure

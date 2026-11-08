@@ -18,10 +18,17 @@ import torch
 from gpu_memory_service.client.torch.allocator import (
     get_or_create_gms_client_memory_manager,
     gms_use_mem_pool,
+    raise_if_gms_allocator_failed,
+    release_gms_mem_pool,
 )
 from gpu_memory_service.client.torch.module import (
+    _iter_module_tensors,
     materialize_module_from_gms,
-    rebind_nonparameter_tensors,
+    register_module_tensors,
+)
+from gpu_memory_service.client.torch.storage import (
+    StorageMapping,
+    copy_non_parameter_tensors_to_default_allocator,
 )
 from gpu_memory_service.common.locks import GrantedLockType
 from gpu_memory_service.common.utils import get_socket_path
@@ -29,12 +36,12 @@ from gpu_memory_service.common.vmm import get_vmm_device_type
 from gpu_memory_service.integrations.common.utils import (
     GMSCommittedMemoryStats,
     get_gms_lock_mode,
-    prepare_gms_write,
     publish_gms_write,
     setup_meta_tensor_workaround,
     strip_gms_model_loader_config,
     torch_device,
 )
+from gpu_memory_service.integrations.vllm import component_reconstruction, glm_reconstruction
 
 if os.environ.get("MX_ENABLED", "0") == "1":
     try:
@@ -60,10 +67,11 @@ _last_imported_weights_bytes: int = 0
 _last_model_memory_usage_offset_bytes: int = 0
 
 # First writer's GMS client awaiting publication after vLLM memory profiling.
-# The retained tensors keep rebound-away GMS pool allocations alive until
-# commit; see rebind_nonparameter_tensors.
+# Storage owners preserve the immutable initial values used by reader metadata.
+# They must outlive publication independently of the mutable TensorImpls.
 _pending_gms_client: "GMSClientMemoryManager | None" = None
-_pending_retained_gms_tensors: list[torch.Tensor] = []
+_pending_retained_gms_tensors: list[torch.UntypedStorage] = []
+_published_gms_tensor_owners: list[torch.UntypedStorage] = []
 
 
 def get_imported_weights_bytes() -> int:
@@ -85,7 +93,7 @@ def _store_pending_gms_write(
     gms_client: "GMSClientMemoryManager",
     stats: GMSCommittedMemoryStats,
     rebound_bytes: int,
-    retained_gms_tensors: list[torch.Tensor],
+    retained_gms_tensors: list[torch.UntypedStorage],
 ) -> None:
     global _last_imported_weights_bytes, _last_model_memory_usage_offset_bytes
     global _pending_gms_client, _pending_retained_gms_tensors
@@ -114,12 +122,16 @@ def publish_pending_gms_write() -> bool:
     original error propagates; the engine cannot serve without published
     weights, and process teardown lets GMS clear the aborted layout.
     """
+    retained = list(_pending_retained_gms_tensors)
     gms_client = _take_pending_gms_write()
     if gms_client is None:
         return False
 
     try:
+        # Profiling can release live pool storage after preparation's check.
+        raise_if_gms_allocator_failed(gms_client)
         publish_gms_write(gms_client)
+        _published_gms_tensor_owners.extend(retained)
     except BaseException:
         try:
             gms_client.close(best_effort=True)
@@ -261,8 +273,17 @@ def _load_read_mode(
     global _last_imported_weights_bytes, _last_model_memory_usage_offset_bytes
 
     try:
-        model = _create_meta_model(vllm_config, model_config)
-        materialize_module_from_gms(gms_client, model, device_index=device_index)
+        if component_reconstruction.selected(vllm_config):
+            model = component_reconstruction.restore(
+                gms_client, vllm_config, model_config, device_index
+            )
+        elif glm_reconstruction.selected_profile(vllm_config):
+            model = glm_reconstruction.restore(
+                gms_client, vllm_config, model_config, device_index
+            )
+        else:
+            model = _create_meta_model(vllm_config, model_config)
+            materialize_module_from_gms(gms_client, model, device_index=device_index)
 
         # MX: register materialized tensors (available for P2P transfer)
         mx_ctx = get_mx_load_context(vllm_config, model_config)
@@ -301,6 +322,7 @@ def _load_write_mode(
     detection (RDMA P2P -> ModelStreamer -> GDS -> disk) with fallback.
     The chain also handles NIXL registration and metadata publishing.
     """
+    component_mode = component_reconstruction.selected(vllm_config)
     if _pending_gms_client is not None:
         raise RuntimeError("A GMS write is already awaiting publication")
 
@@ -329,13 +351,53 @@ def _load_write_mode(
 
             torch_device().empty_cache()
 
-    stats = prepare_gms_write(gms_client, model)
-    # The private clones must exist before vLLM profiles memory so the
-    # profiled peak covers them. The retained GMS originals stay alive until
-    # commit, for readers to materialize from.
-    retained_gms_tensors: list[torch.Tensor] = []
-    rebound_bytes = rebind_nonparameter_tensors(
-        gms_client, model, retain_gms_tensors=retained_gms_tensors
+    before_bytes = gms_client.total_bytes
+    before_count = len(gms_client.mappings)
+    register_module_tensors(gms_client, model)
+    if glm_reconstruction.selected_profile(vllm_config):
+        glm_reconstruction.publish_descriptor(
+            gms_client, model, vllm_config, model_config
+        )
+    if component_mode:
+        component_reconstruction.publish_descriptor(
+            gms_client, model, vllm_config, model_config
+        )
+    # Metadata for private buffers references an immutable initial-value copy.
+    # Keep one source storage owner, including after commit, independently of
+    # the mutable TensorImpls that will be rebound below.
+    retained_gms_tensors = []
+    seen = set()
+    for _, tensor, kind in _iter_module_tensors(model):
+        if kind == "parameter":
+            continue
+        storage = tensor.untyped_storage()
+        if int(storage._cdata) in seen:
+            continue
+        if not any(
+            va <= tensor.data_ptr() < va + m.aligned_size
+            for va, m in gms_client.mappings.items()
+        ):
+            continue
+        seen.add(int(storage._cdata))
+        retained_gms_tensors.append(storage)
+    # Repacking may fill the device with cached pool segments. Dropping the
+    # pool owner first lets Torch free only unused blocks; live StorageImpls
+    # remain owned while the copy executes on the default allocator.
+    torch_device().synchronize(gms_client.device)
+    release_gms_mem_pool(gms_client)
+    _, rebound_bytes = copy_non_parameter_tensors_to_default_allocator(
+        (model,),
+        tuple(
+            StorageMapping(m.va, m.aligned_size) for m in gms_client.mappings.values()
+        ),
+    )
+    torch_device().synchronize(gms_client.device)
+    torch_device().empty_cache()
+    raise_if_gms_allocator_failed(gms_client)
+    stats = GMSCommittedMemoryStats(
+        committed_bytes=gms_client.total_bytes,
+        pruned_bytes=before_bytes - gms_client.total_bytes,
+        pruned_count=before_count - len(gms_client.mappings),
     )
     _store_pending_gms_write(gms_client, stats, rebound_bytes, retained_gms_tensors)
 
@@ -363,9 +425,6 @@ def _create_meta_model(vllm_config, model_config) -> torch.nn.Module:
         with meta_device:
             model = initialize_model(vllm_config=vllm_config, model_config=model_config)
 
-    try:
-        process_weights_after_loading(model, model_config, meta_device)
-    except Exception as e:
-        logger.debug("[GMS] Post-processing on meta tensors: %s", e)
+    process_weights_after_loading(model, model_config, meta_device)
 
     return model
