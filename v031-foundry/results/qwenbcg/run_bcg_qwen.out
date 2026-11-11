@@ -1,0 +1,23 @@
+READY qwenbcg-native startup_s=46.5
+{"label": "qwenbcg-native", "first_request_s": 0.27, "errors": 0, "solo0": " Paris. The capital of France is also the capital of the Rep"}
+graphs: restored=0 breakable_saved=0 breakable_loaded=0 foundry_lines=0
+DONE qwenbcg-native
+READY qwenbcg-save startup_s=44.5
+{"label": "qwenbcg-save", "first_request_s": 0.2, "errors": 0, "solo0": " Paris. The capital of France is also the capital of the Rep"}
+graphs: restored=0 breakable_saved=8 breakable_loaded=0 foundry_lines=260
+DONE qwenbcg-save
+READY qwenbcg-load startup_s=44.5
+{"label": "qwenbcg-load", "first_request_s": 0.2, "errors": 0, "solo0": " Paris. The capital of France is also the capital of the Rep"}
+graphs: restored=4 breakable_saved=0 breakable_loaded=8 foundry_lines=34
+DONE qwenbcg-load
+qwenbcg-save vs qwenbcg-native:
+  solo    identical 4/4  max|dlp| (matched prefix) 0.0000  diverge(idx,pos) []
+  pair    identical 3/4  max|dlp| (matched prefix) 0.0767  diverge(idx,pos) [(2, 21)]
+  batch8  identical 8/8  max|dlp| (matched prefix) 0.0000  diverge(idx,pos) []
+  long    identical 2/2  max|dlp| (matched prefix) 0.0000  diverge(idx,pos) []
+qwenbcg-load vs qwenbcg-native:
+  solo    identical 4/4  max|dlp| (matched prefix) 0.0000  diverge(idx,pos) []
+  pair    identical 3/4  max|dlp| (matched prefix) 0.0767  diverge(idx,pos) [(2, 21)]
+  batch8  identical 8/8  max|dlp| (matched prefix) 0.0807  diverge(idx,pos) []
+  long    identical 2/2  max|dlp| (matched prefix) 0.0000  diverge(idx,pos) []
+BCG_DONE qwenbcg
