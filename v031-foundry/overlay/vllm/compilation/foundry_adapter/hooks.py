@@ -153,6 +153,10 @@ def install_hooks(compilation_config: CompilationConfig) -> None:
     _patch_memory_profiling()
     _patch_subprocess_spawn_sites()
     _patch_deepep()
+    # vLLM 0.31 port: breakable (PIECEWISE) CUDA graph SAVE/LOAD (segments + eager-closure archive)
+    from vllm.compilation.foundry_adapter import breakable
+
+    breakable.install()
 
     _INSTALLED = True
     log.info("[foundry] all patches installed")

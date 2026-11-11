@@ -1,0 +1,20 @@
+READY qwenbcg-native startup_s=48.6
+{"label": "qwenbcg-native", "first_request_s": 0.21, "errors": 0, "solo0": " Paris. The capital of France is also the capital of the Rep"}
+graphs: restored=0 breakable_saved=0 breakable_loaded=0 foundry_lines=0
+DONE qwenbcg-native
+TypeError: breakable SAVE: closure holds an unsupported object LayerName ('<vllm.utils.torch_utils.LayerName object at 0xf9bd74055190>'); closure synthesis cannot archive it
+Traceback (most recent call last):
+    raise RuntimeError(
+RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
+(EngineCore pid=16575) INFO 11-11 18:56:56 [patch.py:271] NVFP4 W4A4 weight_scale NaN-clamp: skipped — upstream serves ModelOpt linears through the generic ModelOptLinearMethod and rejects any NaN weight_scale (unloaded-scale sentinel), so a load-time error replaces the `!!!!` decode-time collapse.
+Traceback (most recent call last):
+    raise RuntimeError(
+RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
+Traceback (most recent call last):
+  File "/results/compare.py", line 27, in <module>
+    main()
+  File "/results/compare.py", line 10, in main
+    o = json.load(open(p))
+                  ^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'out/qwenbcg-save.json'
+BCG_DONE qwenbcg

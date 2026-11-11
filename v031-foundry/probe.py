@@ -54,6 +54,9 @@ def main():
     res["sets"]["solo"] = [run(a.url, [p], 32)[0] for p in PROMPTS[:4]]
     res["sets"]["pair"] = run(a.url, PROMPTS[:2], 32) + run(a.url, PROMPTS[2:4], 32)
     res["sets"]["batch8"] = run(a.url, PROMPTS, 24)
+    # ~300-token prompt: a larger breakable prefill graph (PIECEWISE size 512 when captured)
+    longp = ("The history of the lighthouse begins with fires on hilltops. " * 30) + "Summarize the passage:"
+    res["sets"]["long"] = [run(a.url, [longp], 24)[0], run(a.url, [longp.replace("fires", "beacons")], 24)[0]]
     res["errors"] = sum(1 for v in res["sets"].values() for x in v if "error" in x)
     json.dump(res, open(a.out, "w"), indent=1)
     print(json.dumps(dict(label=a.label, first_request_s=round(res["first_request_s"], 2), errors=res["errors"],

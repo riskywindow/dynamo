@@ -24,9 +24,26 @@ case $PROFILE in
       --enable-prefix-caching --enable-chunked-prefill --disable-custom-all-reduce"
     export VLLM_ALLREDUCE_USE_FLASHINFER=0
     REGION=${GLM_REGION:-512GB} ;;
+  qwenbcg|glmbcg)
+    # breakable prefill graphs (PIECEWISE, eager attention breaks) + FULL decode graphs
+    export VLLM_USE_BREAKABLE_CUDAGRAPH=1
+    MODE=FULL_AND_PIECEWISE
+    if [ $PROFILE = qwenbcg ]; then
+      M=$(ls -d /model-cache/hub/models--Qwen--Qwen3-0.6B/snapshots/* | head -1)
+      SIZES=${QWEN_SIZES:-'[1, 2, 4, 8, 16, 32, 64, 128]'}
+      MODEL_ARGS="--dtype bfloat16 --max-model-len 1024 --max-num-seqs 8 --max-num-batched-tokens 1024 --gpu-memory-utilization 0.5"
+      export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}; REGION=256GB
+    else
+      M=/model-cache/hub/models--nvidia--GLM-5.2-NVFP4/snapshots/aec724e8c7b8ee9db3b48c01c320f63f9cdaf8aa
+      SIZES=${GLM_SIZES:-'[1, 2, 4, 8, 16, 32, 64, 128, 256, 512]'}
+      MODEL_ARGS="--tensor-parallel-size 4 --enable-expert-parallel --max-model-len 40960 --gpu-memory-utilization 0.8 \
+        --num-gpu-blocks-override 5641 --block-size 64 --max-num-batched-tokens 8192 --max-num-seqs 1024 \
+        --enable-prefix-caching --enable-chunked-prefill --disable-custom-all-reduce"
+      export VLLM_ALLREDUCE_USE_FLASHINFER=0; REGION=${GLM_REGION:-512GB}
+    fi ;;
   *) echo "unknown profile $PROFILE"; exit 2 ;;
 esac
-CC="{\"cudagraph_mode\": \"FULL_DECODE_ONLY\", \"cudagraph_capture_sizes\": $SIZES"
+CC="{\"cudagraph_mode\": \"${MODE:-FULL_DECODE_ONLY}\", \"cudagraph_capture_sizes\": $SIZES"
 if [ "$ARM" = native ]; then
   CC="$CC, \"mode\": 0}"
 else
@@ -46,6 +63,6 @@ done
 t1=$(date +%s.%N)
 echo "READY $LABEL startup_s=$(python3 -c "print(round($t1-$t0,1))")"
 python3 -u /results/probe.py --label $LABEL --out /results/out/$LABEL.json
-echo "graphs: restored=$(grep -c 'restored graph descriptor' /results/logs/$LABEL.log) foundry_lines=$(grep -c '\[foundry\]' /results/logs/$LABEL.log)"
+echo "graphs: restored=$(grep -c 'restored graph descriptor' /results/logs/$LABEL.log) breakable_saved=$(grep -c 'breakable SAVE' /results/logs/$LABEL.log) breakable_loaded=$(grep -c 'breakable LOAD' /results/logs/$LABEL.log) foundry_lines=$(grep -c '\[foundry\]' /results/logs/$LABEL.log)"
 pkill -f '[v]llm serve'; sleep 5; pkill -9 -f '[v]llm serve'
 echo "DONE $LABEL"
