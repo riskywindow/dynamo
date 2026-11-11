@@ -183,3 +183,57 @@ def test_profile_rejects_the_unqualified_sparse_context_range():
     assert glm_reconstruction.selected_profile(config(1024))
     with pytest.raises(RuntimeError, match="longer sparse-attention contexts"):
         glm_reconstruction.selected_profile(config(4096))
+
+
+def test_v031_profile_admits_the_qualified_context_range():
+    from gpu_memory_service.integrations.vllm import glm_reconstruction
+
+    def config(length):
+        return SimpleNamespace(
+            load_config=SimpleNamespace(
+                model_loader_extra_config={
+                    "gms_reconstruction_profile": glm_reconstruction.PROFILE_V031,
+                }
+            ),
+            model_config=SimpleNamespace(max_model_len=length),
+        )
+
+    assert glm_reconstruction.selected_profile(config(40960)) == (
+        glm_reconstruction.PROFILE_V031
+    )
+    with pytest.raises(RuntimeError, match="longer sparse-attention contexts"):
+        glm_reconstruction.selected_profile(config(65536))
+
+
+def test_unconfigured_profile_is_not_selected():
+    from gpu_memory_service.integrations.vllm import glm_reconstruction
+
+    config = SimpleNamespace(load_config=SimpleNamespace(model_loader_extra_config={}))
+    assert glm_reconstruction.selected_profile(config) is None
+
+
+@pytest.mark.vllm
+@pytest.mark.core
+def test_meta_kv_scale_processing_is_deferred_until_attach():
+    pytest.importorskip("vllm")
+    try:
+        from vllm.model_executor.utils import weights_already_processed  # noqa: F401
+    except ImportError:
+        pytest.skip("vLLM has no pre-processed weights API")
+    from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
+
+    layer = torch.nn.Module()
+    for name in ("k_scale", "v_scale", "q_scale", "prob_scale"):
+        setattr(layer, name, torch.nn.Parameter(torch.empty((), device="meta")))
+    method = BaseKVCacheMethod.__new__(BaseKVCacheMethod)
+    with model_loader._deferred_meta_kv_scales() as deferred:
+        BaseKVCacheMethod.process_weights_after_loading(method, layer)
+    assert deferred == [(method, layer)]
+    assert not hasattr(layer, "k_scale")
+
+    # After attach, the folded scales come from the published tensors.
+    layer._k_scale = torch.tensor(0.5)
+    layer._v_scale = torch.tensor(0.25)
+    layer._q_scale = torch.tensor(1.0)
+    model_loader._process_deferred_kv_scales(deferred)
+    assert (layer._k_scale_float, layer._v_scale_float) == (0.5, 0.25)

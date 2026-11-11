@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import torch
 from gpu_memory_service.client.torch.allocator import (
@@ -282,8 +284,12 @@ def _load_read_mode(
                 gms_client, vllm_config, model_config, device_index
             )
         else:
-            model = _create_meta_model(vllm_config, model_config)
+            with _deferred_meta_kv_scales() as deferred:
+                model = _create_meta_model(
+                    vllm_config, model_config, device_index=device_index
+                )
             materialize_module_from_gms(gms_client, model, device_index=device_index)
+            _process_deferred_kv_scales(deferred)
 
         # MX: register materialized tensors (available for P2P transfer)
         mx_ctx = get_mx_load_context(vllm_config, model_config)
@@ -410,8 +416,15 @@ def _load_write_mode(
     return model.eval()
 
 
-def _create_meta_model(vllm_config, model_config) -> torch.nn.Module:
-    """Create model on meta device for RO mode materialization."""
+def _create_meta_model(
+    vllm_config, model_config, device_index: int | None = None
+) -> torch.nn.Module:
+    """Create model on meta device for RO mode materialization.
+
+    With ``device_index``, EP expert maps are built on that device: vLLM
+    formats them with ``.item()`` during construction, and they are a pure
+    function of the EP rank and placement (the GMS copy replaces them).
+    """
     from vllm.model_executor.model_loader.utils import (
         initialize_model,
         process_weights_after_loading,
@@ -420,11 +433,75 @@ def _create_meta_model(vllm_config, model_config) -> torch.nn.Module:
 
     setup_meta_tensor_workaround()
     meta_device = torch.device("meta")
+    construction = (
+        glm_reconstruction.construction_context(
+            torch.device(get_vmm_device_type().value, device_index)
+        )
+        if device_index is not None
+        else nullcontext()
+    )
 
-    with set_default_torch_dtype(model_config.dtype):
+    with construction, set_default_torch_dtype(model_config.dtype):
         with meta_device:
             model = initialize_model(vllm_config=vllm_config, model_config=model_config)
 
     process_weights_after_loading(model, model_config, meta_device)
 
     return model
+
+
+_KV_SCALE_PLACEHOLDERS = ("k_scale", "v_scale", "q_scale", "prob_scale")
+
+
+@contextmanager
+def _deferred_meta_kv_scales():
+    """Defer KV-scale post-processing of meta layers until after attach.
+
+    vLLM's KV-cache method compares the checkpoint k/v scales with ``.item()``
+    semantics, which meta tensors cannot answer. The writer already folded
+    those scales into ``_k_scale``/``_v_scale``/``_q_scale`` and published
+    them, so on meta layers the checkpoint placeholders are dropped (as the
+    writer's post-processing did) and the host-side floats are rebuilt from
+    the attached tensors by ``_process_deferred_kv_scales``.
+
+    Only active when vLLM provides ``weights_already_processed`` (>= 0.31).
+    """
+    deferred: list = []
+    try:
+        from vllm.model_executor.layers.quantization.kv_cache import (
+            BaseKVCacheMethod,
+        )
+        from vllm.model_executor.utils import weights_already_processed  # noqa: F401
+    except ImportError:
+        yield deferred
+        return
+
+    original = BaseKVCacheMethod.process_weights_after_loading
+
+    def process(self, layer):
+        placeholders = [
+            getattr(layer, name)
+            for name in _KV_SCALE_PLACEHOLDERS
+            if torch.is_tensor(getattr(layer, name, None))
+        ]
+        if not any(t.is_meta for t in placeholders):
+            return original(self, layer)
+        for name in _KV_SCALE_PLACEHOLDERS:
+            if hasattr(layer, name):
+                delattr(layer, name)
+        deferred.append((self, layer))
+
+    with patch.object(BaseKVCacheMethod, "process_weights_after_loading", process):
+        yield deferred
+
+
+def _process_deferred_kv_scales(deferred: list) -> None:
+    """Rebuild KV-scale floats/CPU copies from the attached GMS tensors."""
+    if not deferred:
+        return
+    from vllm.model_executor.utils import weights_already_processed
+
+    with weights_already_processed():
+        for method, layer in deferred:
+            method.process_weights_after_loading(layer)
+    logger.info("[GMS] Rebuilt KV-scale state for %d attached layers", len(deferred))
