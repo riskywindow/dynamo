@@ -1,0 +1,5 @@
+mode = "save"
+workspace_root = "/results/ws-glm"
+base_addr = "0x600000000000"
+region_size = "512GB"
+scratch_space_size = "2GB"

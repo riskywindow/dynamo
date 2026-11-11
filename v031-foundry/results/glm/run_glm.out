@@ -1,0 +1,21 @@
+READY glm-native startup_s=412.1
+{"label": "glm-native", "first_request_s": 0.53, "errors": 0, "solo0": " Paris. Distance from London to Paris is 342 km, while direc"}
+graphs: restored=0 foundry_lines=0
+DONE glm-native
+READY glm-save startup_s=179.9
+{"label": "glm-save", "first_request_s": 0.51, "errors": 0, "solo0": " Paris. Distance from London to Paris is 342 km, while direc"}
+graphs: restored=0 foundry_lines=93
+DONE glm-save
+READY glm-load startup_s=175.9
+{"label": "glm-load", "first_request_s": 0.51, "errors": 0, "solo0": " Paris. Distance from London to Paris is 342 km, while direc"}
+graphs: restored=28 foundry_lines=117
+DONE glm-load
+glm-save vs glm-native:
+  solo    identical 4/4  max|dlp| (matched prefix) 0.0000  diverge(idx,pos) []
+  pair    identical 3/4  max|dlp| (matched prefix) 0.1926  diverge(idx,pos) [(0, 4)]
+  batch8  identical 3/8  max|dlp| (matched prefix) 0.3758  diverge(idx,pos) [(0, 9), (2, 1), (4, 11), (6, 9)]
+glm-load vs glm-native:
+  solo    identical 4/4  max|dlp| (matched prefix) 0.0000  diverge(idx,pos) []
+  pair    identical 4/4  max|dlp| (matched prefix) 0.0000  diverge(idx,pos) []
+  batch8  identical 2/8  max|dlp| (matched prefix) 0.6750  diverge(idx,pos) [(0, 9), (1, 9), (2, 1), (4, 11)]
+GLM_DONE
