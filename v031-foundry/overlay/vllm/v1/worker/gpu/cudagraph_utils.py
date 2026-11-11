@@ -445,8 +445,18 @@ class CudaGraphManager:
                     # Prepare inputs and get forward function
                     forward_fn = create_forward_fn(desc, warmup=True)
 
-                    # Warmup
-                    forward_fn(CUDAGraphMode.NONE)
+                    # Warmup (Foundry lean SAVE/LOAD may skip it on both sides)
+                    from vllm.compilation.foundry_adapter.config import (
+                        get_config as _foundry_config,
+                    )
+
+                    _fcfg = _foundry_config()
+                    if not (
+                        _fcfg is not None
+                        and _fcfg.mode.value != "none"
+                        and _fcfg.skip_capture_warmup
+                    ):
+                        forward_fn(CUDAGraphMode.NONE)
 
                     # Capture
                     logger.debug(
