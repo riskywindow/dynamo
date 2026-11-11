@@ -146,8 +146,15 @@ def _containing_mapping(
     mappings: tuple[StorageMapping, ...],
     mapping_bases: tuple[int, ...],
 ) -> StorageMapping | None:
-    storage = tensor.untyped_storage()
-    storage_start = int(storage.data_ptr())
+    if tensor.is_meta:
+        return None
+    try:
+        storage = tensor.untyped_storage()
+        storage_start = int(storage.data_ptr())
+    except (RuntimeError, NotImplementedError):
+        # The process-wide scan also sees tensors without real storage
+        # (torch.compile FakeTensor/FunctionalTensor); they cannot be in GMS.
+        return None
     storage_end = storage_start + int(storage.nbytes())
     index = bisect_right(mapping_bases, storage_start) - 1
     if index < 0:

@@ -25,9 +25,9 @@ def selected(vllm_config) -> bool:
     load = getattr(vllm_config, "load_config", None)
     extra = getattr(load, "model_loader_extra_config", None) or {}
     mode = extra.get("gms_reconstruction_mode", "reference")
-    if mode not in ("reference", "components"):
+    if mode not in ("reference", "components", "load_diff"):
         raise ValueError("Unsupported GMS reconstruction mode")
-    if mode == "reference":
+    if mode in ("reference", "load_diff"):
         return False
     if not policy.selected_profile(vllm_config):
         raise RuntimeError("Component reconstruction requires explicit pinned admission")

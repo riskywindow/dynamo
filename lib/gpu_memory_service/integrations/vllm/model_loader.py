@@ -43,7 +43,11 @@ from gpu_memory_service.integrations.common.utils import (
     strip_gms_model_loader_config,
     torch_device,
 )
-from gpu_memory_service.integrations.vllm import component_reconstruction, glm_reconstruction
+from gpu_memory_service.integrations.vllm import (
+    component_reconstruction,
+    glm_reconstruction,
+    load_diff,
+)
 
 if os.environ.get("MX_ENABLED", "0") == "1":
     try:
@@ -275,7 +279,9 @@ def _load_read_mode(
     global _last_imported_weights_bytes, _last_model_memory_usage_offset_bytes
 
     try:
-        if component_reconstruction.selected(vllm_config):
+        if load_diff.selected(vllm_config):
+            model = load_diff.restore(gms_client, vllm_config, model_config, device_index)
+        elif component_reconstruction.selected(vllm_config):
             model = component_reconstruction.restore(
                 gms_client, vllm_config, model_config, device_index
             )
@@ -329,6 +335,8 @@ def _load_write_mode(
     The chain also handles NIXL registration and metadata publishing.
     """
     component_mode = component_reconstruction.selected(vllm_config)
+    load_diff_mode = load_diff.selected(vllm_config)
+    construct_state = None
     if _pending_gms_client is not None:
         raise RuntimeError("A GMS write is already awaiting publication")
 
@@ -347,6 +355,8 @@ def _load_write_mode(
                 model = initialize_model(
                     vllm_config=vllm_config, model_config=model_config
                 )
+            if load_diff_mode:
+                construct_state = load_diff.snapshot(model)
 
             if mx_ctx is not None:
                 # Full MX load strategy chain: RDMA -> ModelStreamer -> GDS -> Default
@@ -367,6 +377,10 @@ def _load_write_mode(
     if component_mode:
         component_reconstruction.publish_descriptor(
             gms_client, model, vllm_config, model_config
+        )
+    if load_diff_mode:
+        load_diff.publish_descriptor(
+            gms_client, model, vllm_config, model_config, construct_state
         )
     # Metadata for private buffers references an immutable initial-value copy.
     # Keep one source storage owner, including after commit, independently of
