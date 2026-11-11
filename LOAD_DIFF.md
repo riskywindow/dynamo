@@ -93,7 +93,22 @@ all-reduce, custom AR off); the writer uses the same config without Foundry.
 | KV / weight VA, both shadows | 0x4a0000000000 / 0x420000000000 | same |
 | GLM LOAD shadow (TP0) | | attach 8.1 s; init engine 20.8 s (profiling capture 8 s + restore 5 s vs SAVE capture 14 s); construct 77.2 s (SAVE 90.6 s); wake 4.25 s |
 
-Not measured yet: a native (no-Foundry) shadow with the same engine config, for the startup comparison; under load.
+**Native baseline** (`native_shadow.sh`: same engine config, no Foundry, shadow captures natively; GLM-5.2):
+
+| GLM-5.2 shadow (TP0) | native capture | Foundry LOAD |
+|---|---|---|
+| construct (`LLM()`) | 80.7 s | 77.2 s |
+| init engine (profile + KV + graphs) | 26.7 s | 20.8 s |
+| graph capture (profiling + final) | 9 + 9 s | 8 + 5 s (restore) |
+| weight attach | 6.6 s | 8.1 s |
+| post-wake vs writer | short identical Δ 0, long within noise | same |
+
+Foundry saves ~3.5 s of startup here: on 0.31 GLM's capture is only ~9 s. The native shadow's 80 s is mostly process
+startup: ~8 s imports before `LLM()`, ~20 s to the engine process, ~17 s worker spawn + imports, ~6 s NCCL; then
+attach 6.6 s, profiling capture ~14 s, KV + final capture ~11 s. Startup time is therefore dominated by what the
+0.27.1 startup stack (bytecode cache, zygote/forkw) attacked, not by graphs. For the replenish-window interference goal
+the relevant Foundry effect is different: removing large collective forwards (profiling run, warmups) from the
+shadow's startup, which needs a loaded (Fig. 10-style) measurement, not startup seconds.
 Results: `~/load-diff-20261111/results-foundry-{qwen,glm}/`.
 
 ## Bugs/gaps found by the second models
