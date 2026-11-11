@@ -31,6 +31,7 @@ This module uses cuda-python bindings for CUDA driver API calls:
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -151,6 +152,28 @@ class LayoutCommit:
     granted_lock_type: GrantedLockType
 
 
+# Fixed-VA mode (DYN_GMS_FIXED_VA=1): every process maps the same allocation at
+# the same VA, so pointers captured into CUDA graphs by one reader stay valid in
+# another (Foundry SAVE/LOAD on GMS shadows). Each tag reserves one whole window
+# when the manager is created (the driver ignores most per-allocation hints once
+# the address space is busy; one early window reservation is honored) and
+# allocations are carved from it. Windows sit below Foundry's default region
+# (0x600000000000); override with DYN_GMS_FIXED_VA_BASE_<TAG> / _SIZE_<TAG>.
+_FIXED_VA_DEFAULTS = {
+    "weights": (0x420000000000, 512 << 30),
+    "kv_cache": (0x4A0000000000, 256 << 30),
+}
+
+
+def _fixed_va_window(tag: Optional[str]) -> Optional[tuple[int, int]]:
+    if os.environ.get("DYN_GMS_FIXED_VA", "0") != "1" or tag not in _FIXED_VA_DEFAULTS:
+        return None
+    base, size = _FIXED_VA_DEFAULTS[tag]
+    env = tag.upper()
+    return (int(os.environ.get(f"DYN_GMS_FIXED_VA_BASE_{env}", str(base)), 0),
+            int(os.environ.get(f"DYN_GMS_FIXED_VA_SIZE_{env}", str(size)), 0))
+
+
 class GMSClientMemoryManager:
     """Unified memory manager for GPU Memory Service.
 
@@ -189,6 +212,15 @@ class GMSClientMemoryManager:
         self._aborted = False
         self._granted_lock_type: Optional[GrantedLockType] = None
 
+        # Fixed-VA mode: imports sit at base + offset of their layout slot;
+        # client-created reservations (scratch/allocations) follow a cursor.
+        window = _fixed_va_window(tag)
+        self._fixed_va_base = window[0] if window else None
+        self._fixed_va_size = window[1] if window else 0
+        self._fixed_va_cursor = self._fixed_va_base
+        self._fixed_slot_offsets: Optional[Dict[int, int]] = None
+        self._fixed_window_reserved = False
+
         # VA-stable unmap/remap state
         self._va_preserved = False
         self._last_memory_layout_hash: str = ""
@@ -196,6 +228,8 @@ class GMSClientMemoryManager:
         self._vmm.ensure_initialized()
         self._vmm.runtime_set_device(device)
         self.granularity = self._vmm.get_allocation_granularity(device)
+        if self._fixed_va_base is not None:
+            self._reserve_fixed_window()
 
     # ==================== Properties ====================
 
@@ -409,7 +443,67 @@ class GMSClientMemoryManager:
     def reserve_va(self, size: int) -> int:
         """Reserve virtual address space (cuMemAddressReserve). No tracking."""
         aligned_size = align_to_granularity(size, self.granularity)
+        if self._fixed_va_base is not None:
+            return self._reserve_next_fixed(aligned_size, self.granularity)
         return self._vmm.address_reserve(aligned_size, self.granularity)
+
+    @property
+    def fixed_va(self) -> bool:
+        return self._fixed_va_base is not None
+
+    def _reserve_fixed_window(self) -> None:
+        base, size = self._fixed_va_base, self._fixed_va_size
+        assert base is not None
+        va = int(self._vmm.address_reserve(size, self.granularity, addr=base))
+        if va != base:
+            self._vmm.address_free(va, size)
+            raise RuntimeError(
+                f"[GMS] fixed VA window 0x{base:x} (+0x{size:x}) is not available for "
+                f"tag {self.tag!r}; the driver returned 0x{va:x}. Set "
+                f"DYN_GMS_FIXED_VA_BASE_{str(self.tag).upper()} to a free range."
+            )
+        self._fixed_window_reserved = True
+        logger.info("[GMS] fixed VA window for %r: 0x%x + %d GiB", self.tag, base, size >> 30)
+
+    def _is_carved(self, va: int) -> bool:
+        return (self._fixed_window_reserved and self._fixed_va_base is not None
+                and self._fixed_va_base <= va < self._fixed_va_base + self._fixed_va_size)
+
+    def _reserve_at(self, size: int, alignment: int, hint: int) -> int:
+        """Carve [hint, hint+size) from the tag's window (no driver call)."""
+        assert self._fixed_va_base is not None
+        if not self._fixed_window_reserved:
+            self._reserve_fixed_window()
+        if hint % alignment or hint + size > self._fixed_va_base + self._fixed_va_size:
+            raise RuntimeError(
+                f"[GMS] 0x{size:x} bytes at 0x{hint:x} do not fit the fixed VA window of "
+                f"tag {self.tag!r}; raise DYN_GMS_FIXED_VA_SIZE_{str(self.tag).upper()}."
+            )
+        return hint
+
+    def _reserve_next_fixed(self, size: int, alignment: int) -> int:
+        assert self._fixed_va_cursor is not None
+        hint = -(-self._fixed_va_cursor // alignment) * alignment
+        va = self._reserve_at(size, alignment, hint)
+        self._fixed_va_cursor = va + size
+        return va
+
+    def _reserve_for_slot(self, layout_slot: int, aligned_size: int) -> int:
+        """VA of an imported allocation: a function of its layout slot only, so
+        it does not depend on import order or on other processes."""
+        assert self._fixed_va_base is not None
+        if self._fixed_slot_offsets is None:
+            offsets, cursor = {}, 0
+            for info in sorted(self.list_handles(), key=lambda h: int(h.layout_slot)):
+                offsets[int(info.layout_slot)] = cursor
+                cursor += align_to_granularity(int(info.aligned_size), self.granularity)
+            self._fixed_slot_offsets = offsets
+            # Client-created reservations go after the imported layout.
+            self._fixed_va_cursor = max(self._fixed_va_cursor, self._fixed_va_base + cursor)
+        offset = self._fixed_slot_offsets.get(layout_slot)
+        if offset is None:
+            raise RuntimeError(f"[GMS] layout slot {layout_slot} is not in the committed layout")
+        return self._reserve_at(aligned_size, self.granularity, self._fixed_va_base + offset)
 
     def map_va(
         self,
@@ -470,7 +564,8 @@ class GMSClientMemoryManager:
             mapping = self._mappings.get(va)
             if mapping is None:
                 return
-        self._vmm.address_free(va, mapping.va_reserved_size)
+        if not self._is_carved(va):
+            self._vmm.address_free(va, mapping.va_reserved_size)
         self._mappings.pop(va, None)
         self._inverse_mapping.pop(mapping.allocation_id, None)
 
@@ -509,7 +604,10 @@ class GMSClientMemoryManager:
             layout_slot = int(info.layout_slot)
 
             fd = self.export_handle(allocation_id)
-            va = self.reserve_va(aligned_size)
+            if self._fixed_va_base is not None:
+                va = self._reserve_for_slot(layout_slot, aligned_size)
+            else:
+                va = self.reserve_va(aligned_size)
             self.map_va(fd, va, alloc_size, allocation_id, alloc_tag, layout_slot)
             return va
 
@@ -758,7 +856,10 @@ class GMSClientMemoryManager:
                 )
             self._shared_scratch_handle = scratch_handle
 
-        va = self._vmm.address_reserve(va_reserved_size, self.scratch_size)
+        if self._fixed_va_base is not None:
+            va = self._reserve_next_fixed(va_reserved_size, self.scratch_size)
+        else:
+            va = self._vmm.address_reserve(va_reserved_size, self.scratch_size)
         for offset in range(0, va_reserved_size, self.scratch_size):
             self._vmm.map(va + offset, self.scratch_size, scratch_handle)
         self._vmm.set_access(va, va_reserved_size, self.device, GrantedLockType.RW)
@@ -872,7 +973,8 @@ class GMSClientMemoryManager:
             if self._shared_scratch_handle != 0 and not self._scratch_mappings:
                 self._vmm.release(self._shared_scratch_handle)
                 self._shared_scratch_handle = 0
-        self._vmm.address_free(base_va, scratch.va_reserved_size)
+        if not self._is_carved(base_va):
+            self._vmm.address_free(base_va, scratch.va_reserved_size)
         return True
 
     # ==================== Lifecycle ====================
@@ -904,6 +1006,9 @@ class GMSClientMemoryManager:
             for va in list(self._mappings.keys()):
                 self.unmap_va(va)
                 self.free_va(va)
+            if self._fixed_window_reserved:
+                self._vmm.address_free(self._fixed_va_base, self._fixed_va_size)
+                self._fixed_window_reserved = False
             self.abort()
         self._unmapped = False
         self._va_preserved = False

@@ -116,7 +116,9 @@ class XpuVMM(VMMDevice):
 
     # ----- virtual address space + mapping ----------------------------------
 
-    def address_reserve(self, size: int, granularity: int) -> int:
+    def address_reserve(self, size: int, granularity: int, addr: int = 0) -> int:
+        if addr:
+            raise NotImplementedError("Fixed-VA reservation is CUDA-only")
         # SYCL reserve_virtual_mem handles alignment internally based on
         # the context's minimum granularity; we pass the requested size.
         return _sycl_vmm.reserve_virtual_mem(size)

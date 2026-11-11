@@ -1254,3 +1254,39 @@ def test_content_commit_path_is_unchanged(gms_thread):
         assert len(reader.list_allocations()) == 1
     finally:
         reader.close()
+
+
+@pytest.mark.timeout(_SOCKET_TEST_TIMEOUT_SECONDS)
+def test_fixed_va_readers_map_each_allocation_at_the_same_address(running_gms, monkeypatch):
+    """DYN_GMS_FIXED_VA=1: the VA depends only on the layout slot, so two readers
+    importing in different orders agree (Foundry graphs captured by one shadow
+    stay valid in another), and an occupied window fails loudly."""
+    _, socket_path = running_gms
+    writer = GMSClientMemoryManager(socket_path, device=0)
+    writer.connect(RequestedLockType.RW)
+    ids = [writer.mappings[writer.create_mapping(size=s, tag="weights")].allocation_id
+           for s in (4096, 3 * 4096, 2 * 4096)]
+    assert writer.commit()
+
+    monkeypatch.setenv("DYN_GMS_FIXED_VA", "1")
+    base = 0x420000000000
+    # Separate processes in practice; here they share one fake VMM, so the
+    # first reader releases its reservations before the second maps.
+    first = GMSClientMemoryManager(socket_path, device=0, tag="weights")
+    first.connect(RequestedLockType.RO)
+    a = {i: first.create_mapping(allocation_id=i) for i in ids}
+    first.close()
+    second = GMSClientMemoryManager(socket_path, device=0, tag="weights")
+    second.connect(RequestedLockType.RO)
+    b = {i: second.create_mapping(allocation_id=i) for i in reversed(ids)}
+    second.close()
+    assert a == b
+    assert sorted(a.values()) == [base, base + 4096, base + 4 * 4096]
+
+    fake_vmm = _vmm_module._vmm_instance
+    fake_vmm.reservations[base] = 4096  # someone else holds the window
+    try:
+        with pytest.raises(RuntimeError, match="fixed VA window 0x420000000000"):
+            GMSClientMemoryManager(socket_path, device=0, tag="weights")
+    finally:
+        fake_vmm.reservations.pop(base, None)

@@ -77,8 +77,8 @@ class FakeVMM(VMMDevice):
         self.imports.add(handle)
         return handle
 
-    def address_reserve(self, size, granularity):
-        va = next(self._vas)
+    def address_reserve(self, size, granularity, addr=0):
+        va = addr if addr and addr not in self.reservations else next(self._vas)
         self.reservations[va] = size
         return va
 

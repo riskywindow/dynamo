@@ -63,10 +63,38 @@ writer; short prompts Δ 0, long prompts Δ 0.03-0.23 (writer's own repeat noise
 | device memory, writer + scratch-KV shadow | 148,927 MiB per GPU | 148.93 (same counter) |
 | park / wake | 0.22 s / 4.35 s | - / 4.3 s |
 
-Not yet tested: Foundry graph LOAD on a load-diff shadow (rebuilt objects could change allocation order
-under the Foundry arena; the layout manifest check would catch it).
-
 Results: `~/load-diff-20261111/results-shadow/`.
+
+## Foundry graph SAVE/LOAD on load-diff shadows (full 0.31 replenish path)
+
+**Problem.** Captured graphs hold raw weight and KV pointers. GMS reserved VA with hint 0, so (a) addresses differ
+per process, and (b) under Foundry's `libcuda_hook` every hint-0 reserve < 2 GB is carved from Foundry's arena, which
+LOAD pre-maps with fresh physical memory before weights load: GMS's `cuMemMap` would hit mapped VA (the lean-v4
+INVALID_VALUE) and the archived span would include a second physical copy of the weights.
+
+**Fix: GMS fixed-VA mode** (`DYN_GMS_FIXED_VA=1`, `client/memory_manager.py`). Each tag reserves one whole window
+when its manager is created (weights `0x420000000000` + 512 GiB, KV `0x4A0000000000` + 256 GiB; override
+`DYN_GMS_FIXED_VA_BASE_<TAG>` / `_SIZE_<TAG>`), and allocations are carved from it: imports at
+`base + offset(layout slot)` (independent of import order and process), scratch/KV reservations by cursor. Hinted
+reserves pass straight through Foundry's hook, so nothing lands in its arena. The window must be reserved early: per
+allocation, the driver ignored the hint (`0x700000000000` -> `0xf4e667c00000` on the first try; peer-mapping step 1
+saw 0/21 honored at LOAD); a failed window reservation is fatal with a clear message.
+
+**Flow** (`v031-scripts/load-diff/foundry_shadow.sh`): GMS writer (disk) -> SAVE shadow (load_diff, fixed VA,
+scratch KV, Foundry SAVE) -> exit -> LOAD shadow (same, Foundry LOAD) -> park -> kill writer -> wake -> generate
+twice. Engine config = the Foundry session's breakable profiles (`FULL_AND_PIECEWISE`, torch.compile off, NCCL
+all-reduce, custom AR off); the writer uses the same config without Foundry.
+
+| | Qwen3-0.6B TP1 | GLM-5.2-NVFP4 TP4+EP |
+|---|---|---|
+| SAVE shadow | 8 breakable prefill sizes archived | 40 breakable sets (10 sizes x 4 ranks) archived |
+| LOAD shadow | 8 breakable + 4 decode restored, no capture | 40 breakable + 40 decode descriptors restored, no capture |
+| post-wake vs writer | 2/2 identical, Δ 0, both generations | short 4/4 identical Δ 0; long prompts Δ <= 0.45; one EOS near-tie at token 6 in 1 of 2 generations (Δ 0.013) |
+| KV / weight VA, both shadows | 0x4a0000000000 / 0x420000000000 | same |
+| GLM LOAD shadow (TP0) | | attach 8.1 s; init engine 20.8 s (profiling capture 8 s + restore 5 s vs SAVE capture 14 s); construct 77.2 s (SAVE 90.6 s); wake 4.25 s |
+
+Not measured yet: a native (no-Foundry) shadow with the same engine config, for the startup comparison; under load.
+Results: `~/load-diff-20261111/results-foundry-{qwen,glm}/`.
 
 ## Bugs/gaps found by the second models
 
