@@ -103,7 +103,22 @@ all-reduce, custom AR off); the writer uses the same config without Foundry.
 | weight attach | 6.6 s | 8.1 s |
 | post-wake vs writer | short identical Δ 0, long within noise | same |
 
-Foundry saves ~3.5 s of startup here: on 0.31 GLM's capture is only ~9 s. The native shadow's 80 s is mostly process
+That comparison used the Foundry bring-up config: 10 capture sizes up to 512. **At vLLM 0.31's default 83 sizes
+(1..1024)** with the lean switches from branch `rvinodkumar/v031-lean-load` (`skip_cudagraph_memory_profile`,
+`skip_capture_warmup`), GLM-5.2:
+
+| GLM-5.2 shadow (TP0), 83 sizes | native capture | lean Foundry LOAD |
+|---|---|---|
+| construct (`LLM()`) | 167.4 s | **65.7 s** |
+| init engine | 111.7 s | **10.1 s** |
+| graph capture / restore | 37 + 65 s | 3 s (332 breakable sets restored) |
+| weight attach | 7.0 s | 6.8 s |
+| wake | 4.4 s | 4.4 s |
+| post-wake vs writer | short identical Δ 0; long within noise | short identical Δ 0; long8k EOS near-tie after the answer in both generations |
+
+The one-time SAVE shadow takes 158 s; archive 9.5 GB per node. Results: `~/load-diff-20261111/results-83/`.
+
+With the 10-size bring-up config: Foundry saves ~3.5 s of startup there: GLM's capture is only ~9 s. The native shadow's 80 s is mostly process
 startup: ~8 s imports before `LLM()`, ~20 s to the engine process, ~17 s worker spawn + imports, ~6 s NCCL; then
 attach 6.6 s, profiling capture ~14 s, KV + final capture ~11 s. Startup time is therefore dominated by what the
 0.27.1 startup stack (bytecode cache, zygote/forkw) attacked, not by graphs. For the replenish-window interference goal
