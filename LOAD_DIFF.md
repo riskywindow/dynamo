@@ -50,6 +50,24 @@ Raw logs and outputs: `~/load-diff-20261111/results/{logs,out}` (pod deleted).
 Warnings seen (not fatal): `_k_scale_cpu`/`_v_scale_cpu` live on CUDA in the writer (constructed under the
 device context) but on CPU after the reader's KV-cache rebuild; value 1.0 on both.
 
+## Replenishment flow with a load-diff shadow (GLM-5.2-NVFP4 TP4/EP4)
+
+`shadow.sh`: writer (disk load, held) -> shadow (`load_diff`, `DYN_GMS_SCRATCH_KV_ENABLED=1`, held) -> park
+(`sleep`) -> kill writer -> `wake` -> generate twice. Both post-wake generations: 6/6 token-identical to the
+writer; short prompts Δ 0, long prompts Δ 0.03-0.23 (writer's own repeat noise 0.14-0.47).
+
+| | load diff (2026-11-11) | GLM profile path (NOTES.md) |
+|---|---|---|
+| weight attach (`Model loading took`) | 7.2 s, 106.33 GiB imported | 6-8 s |
+| shadow construct (`LLM()`, incl. profiling + graph capture) | 158.4 s | 155 s |
+| device memory, writer + scratch-KV shadow | 148,927 MiB per GPU | 148.93 (same counter) |
+| park / wake | 0.22 s / 4.35 s | - / 4.3 s |
+
+Not yet tested: Foundry graph LOAD on a load-diff shadow (rebuilt objects could change allocation order
+under the Foundry arena; the layout manifest check would catch it).
+
+Results: `~/load-diff-20261111/results-shadow/`.
+
 ## Bugs/gaps found by the second models
 
 1. **Constructor CPU tensors left on meta** (Qwen3-0.6B, unquantized: no KV-cache quant method rebuilds
