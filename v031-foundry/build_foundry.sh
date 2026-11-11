@@ -5,6 +5,15 @@
 #     engines run with PYTHONPATH=/results/vllm-site (see env.sh)
 set -x
 export PATH=$HOME/.local/bin:$PATH
+# the image's /usr/local/cuda lacks some dev headers torch's ATen includes (cusparse.h); torch's pip CUDA bundle has them.
+# CPLUS_INCLUDE_PATH is searched after the explicit -I dirs, so it only fills in what /usr/local/cuda/include lacks.
+NV=$(python3 -c "import os,nvidia;print(os.path.dirname(nvidia.__path__[0]))")/nvidia/cu13/include
+# nvml.h (c10/cuda/driver_api.h) is in neither; take it from NVIDIA's nvidia-nvml-dev wheel (header only at build time).
+mkdir -p /results/cuda-extra && [ -f /results/cuda-extra/nvidia/cu13/include/nvml.h ] || {
+  pip download -q --no-deps -d /results/cuda-extra/whl "nvidia-nvml-dev==13.*" && \
+  python3 -m zipfile -e /results/cuda-extra/whl/nvidia_nvml_dev-*.whl /results/cuda-extra; }
+EX=/results/cuda-extra/nvidia/cu13/include
+export CPLUS_INCLUDE_PATH=$NV:$EX${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH} C_INCLUDE_PATH=$NV:$EX${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}
 cd /results && [ -d foundry ] || tar xzf foundry-main.tgz
 pip install -q --user "cmake>=4.0,<5" 2>&1 | tail -1; cmake --version | head -1
 cd /results/foundry && MAX_JOBS=32 TORCH_CUDA_ARCH_LIST="10.0" pip install -v --user --no-build-isolation --no-deps . > /results/foundry-build.log 2>&1

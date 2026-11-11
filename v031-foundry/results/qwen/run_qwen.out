@@ -1,0 +1,21 @@
+READY qwen-native startup_s=62.6
+{"label": "qwen-native", "first_request_s": 0.22, "errors": 0, "solo0": " Paris. The capital of France is also the capital of the Rep"}
+graphs: restored=0 foundry_lines=0
+DONE qwen-native
+READY qwen-save startup_s=52.5
+{"label": "qwen-save", "first_request_s": 0.23, "errors": 0, "solo0": " Paris. The capital of France is also the capital of the Rep"}
+graphs: restored=0 foundry_lines=17
+DONE qwen-save
+READY qwen-load startup_s=44.4
+{"label": "qwen-load", "first_request_s": 0.21, "errors": 0, "solo0": " Paris. The capital of France is also the capital of the Rep"}
+graphs: restored=2 foundry_lines=23
+DONE qwen-load
+qwen-save vs qwen-native:
+  solo    identical 4/4  max|dlp| (matched prefix) 0.0000  diverge(idx,pos) []
+  pair    identical 4/4  max|dlp| (matched prefix) 0.0000  diverge(idx,pos) []
+  batch8  identical 8/8  max|dlp| (matched prefix) 0.0000  diverge(idx,pos) []
+qwen-load vs qwen-native:
+  solo    identical 4/4  max|dlp| (matched prefix) 0.0000  diverge(idx,pos) []
+  pair    identical 4/4  max|dlp| (matched prefix) 0.0000  diverge(idx,pos) []
+  batch8  identical 8/8  max|dlp| (matched prefix) 0.0000  diverge(idx,pos) []
+QWEN_DONE

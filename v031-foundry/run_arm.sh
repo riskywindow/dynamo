@@ -37,7 +37,7 @@ else
 fi
 pkill -9 -f '[v]llm serve'; sleep 3
 t0=$(date +%s.%N)
-setsid nohup vllm serve $M --served-model-name m --trust-remote-code --seed 0 --disable-flashinfer-autotune \
+setsid nohup vllm serve $M --served-model-name m --trust-remote-code --seed 0 --kernel-config '{"enable_flashinfer_autotune": false}' \
   $MODEL_ARGS --compilation-config "$CC" --port 8000 > /results/logs/$LABEL.log 2>&1 < /dev/null &
 until curl -sf localhost:8000/v1/models > /dev/null; do
   sleep 2

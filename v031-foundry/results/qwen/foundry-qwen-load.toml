@@ -1,0 +1,5 @@
+mode = "load"
+workspace_root = "/results/ws-qwen"
+base_addr = "0x600000000000"
+region_size = "256GB"
+scratch_space_size = "2GB"
