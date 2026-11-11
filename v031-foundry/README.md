@@ -1,4 +1,4 @@
-# Foundry on vLLM 0.31: decode-only graphs (step 1 of the port)
+# Foundry on vLLM 0.31: decode graphs (step 1) and breakable prefill graphs (step 2)
 
 Status 2026-11-11: FULL decode CUDA graphs SAVE and LOAD on vLLM 0.31.0 (the Snapshot arm's image,
 `nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.6.0`), for Qwen3-0.6B on one GPU and for GLM-5.2 NVFP4 TP4+EP on 4x GB200.
@@ -44,6 +44,35 @@ decode sizes [1, 2, 4, 8, 16, 32, 64]:
   decode-only capture of 7 sizes takes only 4 s (+ a 7 s memory-profiling capture, which LOAD still runs), so
   decode-only persistence saves little on GLM. The time is in prefill graphs (breakable capture, 59 s in stage 1).
 
+## Step 2: breakable prefill graphs (`overlay/vllm/compilation/foundry_adapter/breakable.py`)
+
+0.31 captures prefill (PIECEWISE) graphs as breakable captures: an ordered chain of plain graph segments with an eager
+closure per attention layer (`lambda: fn(*weak_args, **weak_kwargs)` from `@eager_break_during_capture`). The module
+patches `BreakableCUDAGraphWrapper._capture`:
+- SAVE: each segment is captured into a Foundry graph (same pool, current stream) and saved under the adapter's filename
+  scheme (mode PIECEWISE, segment index in the piecewise slot); `bcg_<descriptor>.json` records the order of segments
+  and breaks, each break's callee (module + qualname), its arguments (tensors as ptr/shape/stride/dtype, modules by
+  their path in the model, `LayerName` and scalars by value) and the entry's output tensors.
+- LOAD: no capture. Segments come back through `finish_one_graph_load` in archived order; closures are rebuilt from the
+  archive (non-owning tensor views via `__cuda_array_interface__`, address checked against the archive; modules looked up
+  by path; callee re-imported). The capture loop's per-size eager warmup still runs, keeping Foundry's allocation
+  trajectory equal to SAVE's.
+- Profiles `qwenbcg` / `glmbcg` in `run_arm.sh` (`VLLM_USE_BREAKABLE_CUDAGRAPH=1`, `FULL_AND_PIECEWISE`); `run_bcg.sh`.
+
+Results (`results/qwenbcg`, `results/glmbcg`):
+- Qwen3-0.6B: 8 prefill sizes x (29 segments + 28 breaks) archived; LOAD rebuilds each in ~5 ms. LOAD vs SAVE
+  token-identical in every set (solo, pair, batch-8, long). SAVE and LOAD both differ from native on one pair prompt at
+  token 21 (capture-path numerics, same place in both).
+- GLM-5.2 TP4+EP (NCCL all-reduce): 10 prefill sizes (1..512 tokens) x 4 ranks, each 79 segments + 78 DSA-attention
+  breaks (bound methods, resolved by module path) + 10 FULL decode graphs per rank; archive 1.3 GB. LOAD rebuilds a
+  prefill size in ~25 ms. Outputs vs native: solo 4/4, pair 4/4, long 2/2 identical (delta 0); batch-8 6/8 (concurrent
+  batching; native-vs-native was 2/8). LOAD vs SAVE: solo/pair/long identical, batch-8 6/8.
+- Graph phase per engine (TP0): native profiling capture 8 s + final capture 9 s (init engine 27.4 s); SAVE 8 + 16 s
+  (35.8 s); LOAD 9 s profiling capture + 6 s warmups/restore (23.8 s). Startup totals are dominated by weight loading
+  from the model PVC (92-235 s, highly variable), which a GMS shadow attach replaces. With 10 sizes up to 512 tokens,
+  GLM's capture on 0.31 is only ~9 s; the remaining LOAD graph time is the per-size eager warmup forwards and the
+  profiling capture.
+
 ## Run
 
 ```bash
@@ -60,9 +89,9 @@ kubectl $NS exec $P -- bash /results/run_glm.sh                # same for GLM-5.
 
 ## Next steps
 
-1. Prefill graphs: breakable PIECEWISE capture (`BreakableCUDAGraphWrapper`, 79 graph segments + 78 eager closures per
-   size on GLM). Hook segment begin/end with Foundry capture/save and archive the eager closures; Foundry's SGLang
-   breakable-graph integration (`integration/sglang/bcg_ops.py`) is the model. This is where GLM's capture time is.
+1. LOAD still runs the eager warmup forward per prefill size and vLLM's memory-profiling capture (~9 s each on GLM).
+   Dropping them needs a matched SAVE (same allocation trajectory without the warmups), as the 0.27.1 lean-load work did,
+   and reusing SAVE's KV budget instead of profiling.
 2. Collectives: restore FlashInfer's fused all-reduce (Lamport/mnnvl fabric buffers) or keep NCCL and measure its
    decode cost against the FlashInfer path.
 3. Skip the memory-profiling capture on LOAD (reuse the SAVE's KV budget), then join with the GMS shadow attach

@@ -1,0 +1,23 @@
+READY glmbcg-native startup_s=330.1
+{"label": "glmbcg-native", "first_request_s": 0.35, "errors": 0, "solo0": " Paris. Distance from London to Paris is 342 km, while direc"}
+graphs: restored=0 breakable_saved=0 breakable_loaded=0 foundry_lines=0
+DONE glmbcg-native
+READY glmbcg-save startup_s=202.5
+{"label": "glmbcg-save", "first_request_s": 0.39, "errors": 0, "solo0": " Paris. Distance from London to Paris is 342 km, while direc"}
+graphs: restored=0 breakable_saved=40 breakable_loaded=0 foundry_lines=3074
+DONE glmbcg-save
+READY glmbcg-load startup_s=271.4
+{"label": "glmbcg-load", "first_request_s": 0.35, "errors": 0, "solo0": " Paris. Distance from London to Paris is 342 km, while direc"}
+graphs: restored=40 breakable_saved=0 breakable_loaded=40 foundry_lines=174
+DONE glmbcg-load
+glmbcg-save vs glmbcg-native:
+  solo    identical 4/4  max|dlp| (matched prefix) 0.0000  diverge(idx,pos) []
+  pair    identical 4/4  max|dlp| (matched prefix) 0.0000  diverge(idx,pos) []
+  batch8  identical 5/8  max|dlp| (matched prefix) 0.5625  diverge(idx,pos) [(0, 14), (1, 17), (2, 1)]
+  long    identical 2/2  max|dlp| (matched prefix) 0.0000  diverge(idx,pos) []
+glmbcg-load vs glmbcg-native:
+  solo    identical 4/4  max|dlp| (matched prefix) 0.0000  diverge(idx,pos) []
+  pair    identical 4/4  max|dlp| (matched prefix) 0.0000  diverge(idx,pos) []
+  batch8  identical 6/8  max|dlp| (matched prefix) 0.8517  diverge(idx,pos) [(0, 14), (1, 9)]
+  long    identical 2/2  max|dlp| (matched prefix) 0.0000  diverge(idx,pos) []
+BCG_DONE glmbcg
