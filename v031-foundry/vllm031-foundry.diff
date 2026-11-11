@@ -1,0 +1,1950 @@
+--- a/vllm/compilation/foundry_adapter/__init__.py
++++ b/vllm/compilation/foundry_adapter/__init__.py
+@@ -0,0 +1,23 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""vLLM lifecycle integration for the optional Foundry CUDA backend."""
++
++from typing import TYPE_CHECKING
++
++from .config import CUDAGraphExtensionMode, get_graph_extension_mode
++
++if TYPE_CHECKING:
++    from vllm.config import CompilationConfig
++
++
++def install_hooks(compilation_config: "CompilationConfig") -> None:
++    from .hooks import install_hooks as install
++
++    install(compilation_config)
++
++
++__all__ = [
++    "CUDAGraphExtensionMode",
++    "get_graph_extension_mode",
++    "install_hooks",
++]
+--- a/vllm/compilation/foundry_adapter/config.py
++++ b/vllm/compilation/foundry_adapter/config.py
+@@ -0,0 +1,163 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# SPDX-FileCopyrightText: Copyright contributors to the Foundry project
++"""Foundry vLLM-integration configuration.
++
++Provides `CUDAGraphExtensionMode`, `CUDAGraphExtensionConfig`,
++`load_graph_extension_config`, and the rank-computation helper.
++"""
++
++from __future__ import annotations
++
++import enum
++import importlib.util
++import tomllib
++from dataclasses import dataclass
++from pathlib import Path
++from typing import TYPE_CHECKING
++
++from vllm.logger import init_logger
++
++if TYPE_CHECKING:
++    from vllm.config import ParallelConfig
++
++log = init_logger("vllm.foundry.config")
++
++
++class CUDAGraphExtensionMode(enum.StrEnum):
++    NONE = "none"
++    SAVE = "save"
++    LOAD = "load"
++
++
++@dataclass
++class CUDAGraphExtensionConfig:
++    mode: CUDAGraphExtensionMode = CUDAGraphExtensionMode.NONE
++    hook_library_path: str | None = None
++    # Path to libnvshmem_host.so for NVSHMEM-based kernels (e.g. DeepEP).
++    nvshmem_host_path: str | None = None
++    base_addr: int = 0x600000000000
++    region_size: str = "64GB"
++    workspace_root: str = "foundry_archive"
++    workspace_dir: str | None = None
++    # Re-capture graphs on LOAD when archived replay is incompatible with the
++    # current runtime.  This is a bring-up fallback; the archive path remains
++    # the default.
++    recapture_on_load: bool = False
++    # Scratch space reserved for non-deterministic NCCL allocations.
++    # After skip_to_scratch_boundary(), allocations start from
++    # base_addr + scratch_space_size.
++    scratch_space_size: str = "64MB"
++    # Contiguous physical pool for daemon-owned IPC weights. Importing one
++    # large allocation preserves its base across independent engine processes.
++    weight_cache_size: str | None = None
++
++    @classmethod
++    def from_toml(cls, path: str | Path) -> CUDAGraphExtensionConfig:
++        with open(path, "rb") as f:
++            data = tomllib.load(f)
++
++        mode_str = data.get("mode", cls.mode.value)
++        mode = CUDAGraphExtensionMode(mode_str)
++
++        base_addr_value = data.get("base_addr", cls.base_addr)
++        base_addr = (
++            int(base_addr_value, 0)
++            if isinstance(base_addr_value, str)
++            else base_addr_value
++        )
++
++        hook_library_path = data.get("hook_library_path")
++        if hook_library_path is None:
++            hook_library_path = cls._detect_hook_so_path()
++
++        return cls(
++            mode=mode,
++            hook_library_path=hook_library_path,
++            nvshmem_host_path=data.get("nvshmem_host_path"),
++            base_addr=base_addr,
++            region_size=data.get("region_size", cls.region_size),
++            workspace_root=data.get("workspace_root", cls.workspace_root),
++            scratch_space_size=data.get("scratch_space_size", cls.scratch_space_size),
++            weight_cache_size=data.get("weight_cache_size"),
++            recapture_on_load=data.get("recapture_on_load", cls.recapture_on_load),
++        )
++
++    @staticmethod
++    def _detect_hook_so_path() -> str | None:
++        spec = importlib.util.find_spec("foundry.ops")
++        if spec and spec.origin:
++            ops_so_path = Path(spec.origin).resolve()
++            hook_so_path = ops_so_path.parent / "libcuda_hook.so"
++            if hook_so_path.exists():
++                return str(hook_so_path)
++        return None
++
++
++# Module-global config singleton (process-local).
++_config: CUDAGraphExtensionConfig | None = None
++
++
++def load_graph_extension_config(path: str) -> None:
++    """Load TOML and set the process-local `_config` singleton.
++
++    Idempotent for the same path; loading a different path replaces.
++    """
++    global _config
++    _config = CUDAGraphExtensionConfig.from_toml(path)
++
++
++def get_config() -> CUDAGraphExtensionConfig | None:
++    return _config
++
++
++def get_graph_extension_mode() -> CUDAGraphExtensionMode:
++    if _config is None:
++        return CUDAGraphExtensionMode.NONE
++    return _config.mode
++
++
++def get_workspace_root() -> str | None:
++    if _config is None:
++        return None
++    return _config.workspace_root
++
++
++def get_workspace_dir() -> str | None:
++    if _config is None:
++        return None
++    return _config.workspace_dir
++
++
++def get_hook_library_path() -> str | None:
++    if _config is None:
++        return None
++    return _config.hook_library_path
++
++
++def get_nvshmem_host_path() -> str | None:
++    if _config is None:
++        return None
++    return _config.nvshmem_host_path
++
++
++def _compute_rank_from_parallel_config(
++    parallel_config: ParallelConfig,
++) -> int:
++    """Unique global rank for workspace naming.
++
++    Latest vLLM resets `data_parallel_rank=0` and `data_parallel_size=1`
++    in each non-MoE DP replica (`vllm/v1/engine/core.py` "treat like DP=1"
++    branch). `data_parallel_index` is the only DP shard identifier that
++    survives that reset. `parallel_config.rank` is the TP/PP rank inside
++    the shard; `parallel_config.world_size` is TP*PP*DCP per shard.
++    """
++    dp_index = parallel_config.data_parallel_index
++    return dp_index * parallel_config.world_size + parallel_config.rank
++
++
++def _uses_deepep_backend(parallel_config: ParallelConfig) -> bool:
++    return parallel_config.all2all_backend in (
++        "deepep_low_latency",
++        "deepep_high_throughput",
++    )
+--- a/vllm/compilation/foundry_adapter/graph_ops.py
++++ b/vllm/compilation/foundry_adapter/graph_ops.py
+@@ -0,0 +1,375 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# SPDX-FileCopyrightText: Copyright contributors to the Foundry project
++"""Graph capture / save / load mechanics.
++
++Provides `capture_or_load_graph`, `start_graph_builds`,
++`save_graph_manifest`, `pack_fatbins` and helpers.
++
++LOAD uses per-graph finish: `capture_or_load_graph` calls
++`FoundryCUDAGraph.finish_one_graph_load(pending, index)` for the
++current batch's identifier, so allocator-event replay interleaves with
++the upstream capture loop's between-capture work.
++
++`start_graph_builds` is invoked from `_load_model_with_overlap`
++in the worker process (not `EngineCore._initialize_kv_caches`) so it
++works across executor types.
++"""
++
++from __future__ import annotations
++
++import os
++import time
++from collections.abc import Callable
++from dataclasses import dataclass
++from typing import TYPE_CHECKING
++
++import foundry as foundry_pkg
++import regex as re
++import torch
++from foundry import ops as fops
++from foundry.graph import CUDAGraph as FoundryCUDAGraph
++from foundry.graph import graph as foundry_graph_ctx
++
++from vllm.compilation.foundry_adapter.config import (
++    CUDAGraphExtensionMode,
++    get_config,
++    get_graph_extension_mode,
++)
++from vllm.compilation.foundry_adapter.runtime import get_state
++from vllm.config import CUDAGraphMode
++from vllm.forward_context import BatchDescriptor
++from vllm.logger import init_logger
++from vllm.utils.torch_utils import weak_ref_tensors
++
++if TYPE_CHECKING:
++    from torch.cuda import _POOL_HANDLE  # noqa: F401
++
++log = init_logger("vllm.foundry.graph_ops")
++
++
++# (runtime_mode, batch_descriptor, piecewise_compile_index)
++GraphIdentifier = tuple[CUDAGraphMode, BatchDescriptor, "int | None"]
++
++
++# ---------------------------------------------------------------------------
++# Identifier / filename / metadata serialization
++# ---------------------------------------------------------------------------
++
++
++def _piecewise_index(runtime_mode: CUDAGraphMode, runnable: Callable) -> int | None:
++    """`piecewise_compile_index` if this is a PIECEWISE batch, else None.
++
++    Used by both SAVE (when writing the per-graph filename) and LOAD (when
++    looking up the pre-built template index).
++    """
++    if runtime_mode != CUDAGraphMode.PIECEWISE:
++        return None
++    from vllm.compilation.piecewise_backend import PiecewiseBackend
++
++    assert isinstance(runnable, PiecewiseBackend), (
++        "For PIECEWISE mode, runnable must be PiecewiseBackend"
++    )
++    return runnable.piecewise_compile_index
++
++
++def _build_graph_filename(
++    index: int,
++    runtime_mode: CUDAGraphMode,
++    batch_descriptor: BatchDescriptor,
++    piecewise_compile_index: int | None,
++) -> str:
++    mode = runtime_mode.name
++    tokens = batch_descriptor.num_tokens
++    reqs = batch_descriptor.num_reqs if batch_descriptor.num_reqs is not None else "N"
++    uniform = "U" if batch_descriptor.uniform else "X"
++    lora = batch_descriptor.num_active_loras
++    pc = piecewise_compile_index if piecewise_compile_index is not None else "N"
++    return f"graph_{index}_{mode}_t{tokens}_r{reqs}_{uniform}_l{lora}_pc{pc}.json"
++
++
++_GRAPH_FILENAME_RE = re.compile(
++    r"graph_(\d+)_([A-Z_]+)_t(\d+)_r(\d+|N)_([UX])_l(\d+)_pc(\d+|N)\.json$"
++)
++
++
++def _parse_graph_filename(
++    filename: str,
++) -> tuple[int, CUDAGraphMode, BatchDescriptor, int | None] | None:
++    m = _GRAPH_FILENAME_RE.match(filename)
++    if not m:
++        return None
++    index = int(m.group(1))
++    mode = CUDAGraphMode[m.group(2)]
++    num_tokens = int(m.group(3))
++    num_reqs = int(m.group(4)) if m.group(4) != "N" else None
++    uniform = m.group(5) == "U"
++    num_active_loras = int(m.group(6))
++    pc = int(m.group(7)) if m.group(7) != "N" else None
++    bd = BatchDescriptor(
++        num_tokens=num_tokens,
++        num_reqs=num_reqs,
++        uniform=uniform,
++        num_active_loras=num_active_loras,
++    )
++    return index, mode, bd, pc
++
++
++# ---------------------------------------------------------------------------
++# capture_or_load_graph — capture/restore entry from the GPU graph manager
++# ---------------------------------------------------------------------------
++
++
++def capture_or_load_graph(
++    batch_descriptor: BatchDescriptor,
++    runnable: Callable,
++    weak_ref_output: bool,
++    runtime_mode: CUDAGraphMode,
++    graph_pool: _POOL_HANDLE,
++    runnable_args: tuple = (),
++    runnable_kwargs: dict | None = None,
++):
++    """Capture (NONE/SAVE) or look up (LOAD) a CUDA graph for one batch.
++
++    Returns a `(graph, output)` tuple. `graph` is either
++    `torch.cuda.CUDAGraph` (NONE) or `foundry.CUDAGraph` (SAVE/LOAD).
++    """
++    if runnable_kwargs is None:
++        runnable_kwargs = {}
++
++    # The native vLLM capture path enters ``capture_pool`` before running the
++    # model.  That context also points NCCL's graph allocator at the same
++    # pool.  Foundry captures at the CUDA-driver layer, so reproduce that
++    # binding explicitly before either SAVE capture or LOAD construction.
++    from vllm.distributed.device_communicators.pynccl_allocator import (
++        set_graph_pool_id,
++    )
++    from vllm.platforms import current_platform
++
++    set_graph_pool_id(graph_pool or current_platform.graph_pool_handle())
++
++    mode = get_graph_extension_mode()
++
++    if mode == CUDAGraphExtensionMode.NONE:
++        cudagraph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(cudagraph, pool=graph_pool):
++            output = runnable(*runnable_args, **runnable_kwargs)
++            if weak_ref_output:
++                output = weak_ref_tensors(output)
++        return cudagraph, output
++
++    cfg = get_config()
++    state = get_state()
++    if cfg is None or state is None:
++        raise RuntimeError("Graph extension is not initialized")
++
++    piecewise_compile_index = _piecewise_index(runtime_mode, runnable)
++
++    if mode == CUDAGraphExtensionMode.SAVE:
++        # vLLM main: the offloader's copy stream is forked by the last
++        # layer's prefetch and must be joined inside the capture (no-op when
++        # CPU offloading is off; absent on older branches).
++        try:
++            from vllm.model_executor.offloader.base import get_offloader
++        except ImportError:
++            get_offloader = None  # type: ignore[assignment]
++
++        graph = FoundryCUDAGraph()
++        # The runner's output buffer must be allocated while Foundry's
++        # deterministic VMM region is active.  ``torch.cuda`` capture state
++        # is not visible for Foundry's driver-level capture context, so use
++        # an explicit runtime marker for the output allocation hook.
++        from vllm.compilation.foundry_adapter import runtime as rt
++
++        rt.set_capture_active(True)
++        try:
++            # Keep Foundry's fixed capture stream.  LOAD reconstructs graph
++            # templates on the same process-local stream; using the runner's
++            # transient stream here changes the recorded stream dependencies
++            # across SAVE and LOAD.
++            with foundry_graph_ctx(graph, pool=graph_pool):
++                output = runnable(*runnable_args, **runnable_kwargs)
++                if get_offloader is not None:
++                    get_offloader().join_after_forward()
++        finally:
++            rt.set_capture_active(False)
++
++        assert cfg.workspace_dir is not None
++        # The filename alone encodes everything LOAD needs (mode, batch_descriptor,
++        # piecewise index). The JSON body that foundry.graph.save writes is for
++        # debugging only — we don't read it back on LOAD.
++        filename = _build_graph_filename(
++            state.capture_index,
++            runtime_mode,
++            batch_descriptor,
++            piecewise_compile_index,
++        )
++        json_path = os.path.join(cfg.workspace_dir, filename)
++        graph.save(json_path, output)
++        state.capture_index += 1
++
++        if weak_ref_output:
++            output = weak_ref_tensors(output)
++        return graph, output
++
++    if mode == CUDAGraphExtensionMode.LOAD:
++        if cfg.recapture_on_load:
++            # Keep Foundry's module/VMM setup, but rebuild the graph in the
++            # current process while the archive replay path is being brought
++            # up.  This isolates runtime integration issues from graph
++            # serialization issues and preserves the normal vLLM capture path.
++            from vllm.compilation.foundry_adapter import runtime as rt
++
++            graph = torch.cuda.CUDAGraph()
++            rt.set_capture_active(True)
++            try:
++                with torch.cuda.graph(graph, pool=graph_pool):
++                    output = runnable(*runnable_args, **runnable_kwargs)
++            finally:
++                rt.set_capture_active(False)
++            if weak_ref_output:
++                output = weak_ref_tensors(output)
++            log.info("[foundry] LOAD recapture fallback for %s", batch_descriptor)
++            return graph, output
++
++        identifier: GraphIdentifier = (
++            runtime_mode,
++            batch_descriptor,
++            piecewise_compile_index,
++        )
++        if _pending_graph_builds is None:
++            raise RuntimeError(
++                "capture_or_load_graph called on LOAD but no pending graph "
++                "builds — was start_graph_builds() called first?"
++            )
++        index = _pending_graph_builds.identifier_to_index.get(identifier)
++        if index is None:
++            raise RuntimeError(f"Graph identifier not in pending builds: {identifier}")
++        graph, output = FoundryCUDAGraph.finish_one_graph_load(
++            _pending_graph_builds.pending, index
++        )
++        # Keep VMM-backed outputs alive across captures and subsequent replay.
++        state.loaded_graphs[identifier] = (graph, output)
++        return graph, output
++
++    raise RuntimeError(
++        f"capture_or_load_graph called with mode {mode}, expected NONE, SAVE, or LOAD"
++    )
++
++
++# ---------------------------------------------------------------------------
++# LOAD pipeline: start_graph_builds (background) → per-graph finish on demand
++#
++# capture_or_load_graph calls finish_one_graph_load(pending, index) per
++# batch as the patched capture_model's loop walks them. This keeps the
++# foundry VMM cursor on LOAD walking the same trajectory it did on SAVE:
++# allocations between captures (attention metadata, dummy inputs) happen
++# on both sides in the same order, interleaved with replayed graph events.
++# ---------------------------------------------------------------------------
++
++
++@dataclass
++class _PendingGraphBuilds:
++    pending: object  # opaque PendingGraphLoads handle from C++
++    identifier_to_index: dict[GraphIdentifier, int]
++
++
++_pending_graph_builds: _PendingGraphBuilds | None = None
++
++
++def _scan_graph_files(
++    workspace_dir: str,
++) -> list[tuple[int, str, tuple]]:
++    """Return (index, filename, (mode, batch_descriptor, pc)) per graph file,
++    sorted by index. Only the encoded-filename format is accepted — SAVE
++    always writes that format, and LOAD never needs to read the JSON body."""
++    graph_files: list[tuple[int, str, tuple]] = []
++    for filename in os.listdir(workspace_dir):
++        if not filename.startswith("graph_") or not filename.endswith(".json"):
++            continue
++        parsed = _parse_graph_filename(filename)
++        if parsed is None:
++            continue
++        index, mode, batch_desc, pc = parsed
++        graph_files.append((index, filename, (mode, batch_desc, pc)))
++    graph_files.sort(key=lambda x: x[0])
++    return graph_files
++
++
++def start_graph_builds() -> None:
++    """Phase 1: kick off background template builds.
++
++    Called from `_load_model_with_overlap` (worker process) on LOAD,
++    AFTER `do_original_load()` completes. Background threads build
++    cuGraph templates and prepare on-demand graphs concurrently with
++    everything that happens between weight load and `capture_model`
++    (KV cache init etc). Running template builds in parallel with the
++    weight load itself was tried earlier and dropped: it slowed weight
++    load down (driver contention) without recovering meaningful time
++    on the template side.
++    """
++    global _pending_graph_builds
++    if _pending_graph_builds is not None:
++        return
++    cfg = get_config()
++    state = get_state()
++    if cfg is None or state is None:
++        return
++    if cfg.mode != CUDAGraphExtensionMode.LOAD:
++        return
++
++    workspace_dir = cfg.workspace_dir
++    if workspace_dir is None:
++        return
++
++    graph_files = _scan_graph_files(workspace_dir)
++    json_paths = [
++        os.path.join(workspace_dir, filename) for _, filename, _ in graph_files
++    ]
++    if not json_paths:
++        return
++
++    num_threads = 4
++    s = time.perf_counter()
++    log.info(
++        "[foundry] Starting early graph builds (%d graphs, %d threads)",
++        len(json_paths),
++        num_threads,
++    )
++    pending = FoundryCUDAGraph.start_graph_builds(json_paths, num_threads=num_threads)
++    log.info(
++        "[foundry] start_graph_builds returned in %.3fs (building in background)",
++        time.perf_counter() - s,
++    )
++
++    # Parsed-filename metadata is already in (runtime_mode, batch_descriptor,
++    # piecewise_compile_index) shape — the same shape as the runtime identifier
++    # built inside capture_or_load_graph — so just reuse it directly.
++    identifier_to_index: dict[GraphIdentifier, int] = {
++        metadata: i for i, (_index, _filename, metadata) in enumerate(graph_files)
++    }
++
++    _pending_graph_builds = _PendingGraphBuilds(
++        pending=pending,
++        identifier_to_index=identifier_to_index,
++    )
++
++
++# ---------------------------------------------------------------------------
++# SAVE post-capture: manifest + fatbin packing
++# ---------------------------------------------------------------------------
++
++
++def save_graph_manifest() -> None:
++    cfg = get_config()
++    if cfg is None or cfg.workspace_dir is None:
++        return
++    foundry_pkg.save_graph_manifest(cfg.workspace_dir)
++
++
++def pack_fatbins() -> None:
++    cfg = get_config()
++    if cfg is None or cfg.workspace_dir is None:
++        raise RuntimeError("Graph extension is not initialized")
++    fops.pack_fatbins_to_folder(cfg.workspace_dir)
++    fops.set_pack_fatbins_on_exit(False)
+--- a/vllm/compilation/foundry_adapter/hooks.py
++++ b/vllm/compilation/foundry_adapter/hooks.py
+@@ -0,0 +1,545 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# SPDX-FileCopyrightText: Copyright contributors to the Foundry project
++"""Runtime monkey-patch installer for the foundry vLLM integration.
++
++Pattern: wrap orig + insert foundry calls. For functions that must be
++skipped on SAVE/LOAD (non-deterministic allocations), the patch replaces
++the callee with a no-op dummy. The runner keeps its native profiling
++and capture lifecycle.
++"""
++
++from __future__ import annotations
++
++import functools
++import os
++import time
++from collections.abc import Callable
++from typing import TYPE_CHECKING
++
++import torch
++
++from vllm.compilation.foundry_adapter import runtime as rt
++from vllm.compilation.foundry_adapter.config import (
++    CUDAGraphExtensionMode,
++    get_config,
++    get_graph_extension_mode,
++    get_workspace_root,
++    load_graph_extension_config,
++)
++from vllm.logger import init_logger
++
++if TYPE_CHECKING:
++    from vllm.config import CompilationConfig
++
++log = init_logger("vllm.foundry.hooks")
++
++_INSTALLED = False
++
++
++def _reset_install_state_after_fork() -> None:
++    """Reinstall hooks in a worker forked after the engine process."""
++    global _INSTALLED
++    _INSTALLED = False
++
++
++os.register_at_fork(after_in_child=_reset_install_state_after_fork)
++
++
++def _quarantine_get_device_capability() -> None:
++    """Serve `torch.cuda.get_device_capability` from NVML so flashinfer's
++    module-level init can't trigger `torch.cuda._lazy_init` in the parent.
++
++    If the parent ever initializes CUDA, vLLM's `_maybe_force_spawn`
++    overrides our forkserver choice to spawn — killing the fork-based
++    fast-start path entirely. NVML reads the same (major, minor) tuple
++    without creating a CUDA runtime context, so the parent stays
++    fork-safe.
++    """
++    import torch
++
++    try:
++        import pynvml
++    except ImportError:
++        log.info(
++            "[foundry] pynvml not available; cannot quarantine "
++            "get_device_capability — parent may still init CUDA"
++        )
++        return
++    orig = torch.cuda.get_device_capability
++    _nvml_started = {"v": False}
++
++    def _resolve_index(device) -> int:
++        if device is None:
++            return 0
++        if isinstance(device, int):
++            return device
++        if hasattr(device, "index"):
++            return device.index or 0
++        return int(device)
++
++    def patched(device=None):
++        try:
++            if not _nvml_started["v"]:
++                pynvml.nvmlInit()
++                _nvml_started["v"] = True
++            idx = _resolve_index(device)
++            h = pynvml.nvmlDeviceGetHandleByIndex(idx)
++            return pynvml.nvmlDeviceGetCudaComputeCapability(h)
++        except Exception:
++            return orig(device)
++
++    torch.cuda.get_device_capability = patched
++    log.info(
++        "[foundry] torch.cuda.get_device_capability → NVML (keeps parent fork-safe)"
++    )
++
++
++def install_hooks(compilation_config: CompilationConfig) -> None:
++    """Idempotent. Loads the TOML and installs all patches."""
++    global _INSTALLED
++    if _INSTALLED:
++        return
++    cfg_path = compilation_config.graph_extension_config_path
++    if not cfg_path:
++        return
++
++    # Must run BEFORE anything that might import flashinfer. Cheap + safe to
++    # run in every process: when called in the engine child (after fork),
++    # CUDA init is already OK to happen, the patch just keeps returning the
++    # correct capability without paying for it.
++    _quarantine_get_device_capability()
++
++    # Measure subprocess spawn cost (parent stamped FOUNDRY_SPAWN_T0_NS right
++    # before fork; we are at the first foundry code that runs in the child).
++    # This window is Python + torch + vllm cold import with the LD_PRELOAD'd
++    # hook, plus vLLM's pre-install_hooks scaffolding — the biggest single
++    # chunk of LOAD time on remote servers.
++    t0_ns_str = os.environ.get("FOUNDRY_SPAWN_T0_NS")
++    if t0_ns_str:
++        spawn_elapsed_ms = (time.perf_counter_ns() - int(t0_ns_str)) / 1e6
++        log.info(
++            "[foundry TIMING] subprocess spawn → install_hooks: %.1f ms "
++            "(cold Python + torch + vllm import with LD_PRELOAD'd hook)",
++            spawn_elapsed_ms,
++        )
++
++    load_graph_extension_config(cfg_path)
++    log.info(
++        "[foundry] install_hooks: mode=%s workspace=%s",
++        get_graph_extension_mode().value,
++        get_workspace_root(),
++    )
++
++    if get_graph_extension_mode() == CUDAGraphExtensionMode.NONE:
++        _INSTALLED = True
++        return
++
++    from vllm.config import CompilationMode
++
++    # LOAD reconstructs CUDA kernels without rebuilding the Torch compiled
++    # model. Keep SAVE's uncaptured forwards (notably prefill) on that same
++    # path: compiled SAVE and uncompiled LOAD can select different kernels
++    # and produce different tokens before the restored decode graph runs.
++    # FULL CUDA graphs remain enabled independently of Torch compilation.
++    compilation_config.mode = CompilationMode.NONE
++    log.info("[foundry] disabled Torch compilation for both SAVE and LOAD")
++
++    _patch_init_worker_distributed_environment()
++    _patch_kernel_warmup()
++    _patch_load_model()
++    _patch_capture_model()
++    _patch_profile_cudagraph_memory()
++    _patch_memory_profiling()
++    _patch_subprocess_spawn_sites()
++    _patch_deepep()
++
++    _INSTALLED = True
++    log.info("[foundry] all patches installed")
++
++
++# ---------------------------------------------------------------------------
++# VMM region setup around NCCL.
++# ---------------------------------------------------------------------------
++
++
++def _patch_init_worker_distributed_environment() -> None:
++    from vllm.v1.worker import gpu_worker as gw
++
++    orig = gw.init_worker_distributed_environment
++
++    @functools.wraps(orig)
++    def patched(
++        vllm_config, rank, distributed_init_method=None, local_rank=-1, backend="nccl"
++    ):
++        active = get_graph_extension_mode() != CUDAGraphExtensionMode.NONE
++        t0 = time.perf_counter()
++        if active:
++            rt.setup_graph_extension(vllm_config.parallel_config)
++        result = orig(vllm_config, rank, distributed_init_method, local_rank, backend)
++        if active:
++            rt.skip_to_scratch_boundary()
++            log.info(
++                "[foundry TIMING] init_worker_distributed_environment total: "
++                "%.3f s (setup_graph_extension + NCCL + skip_to_scratch)",
++                time.perf_counter() - t0,
++            )
++        return result
++
++    gw.init_worker_distributed_environment = patched
++
++
++# ---------------------------------------------------------------------------
++# Skip-with-dummy patches for non-deterministic functions.
++# ---------------------------------------------------------------------------
++
++
++def _patch_kernel_warmup() -> None:
++    # Captured kernels are archived by Foundry; keep the separate autotune
++    # warmup from changing the SAVE/LOAD allocation trajectory.
++    import vllm.v1.worker.gpu_worker as gw
++
++    orig = gw.kernel_warmup
++
++    @functools.wraps(orig)
++    def patched(worker):
++        # Foundry archives the CUDA modules and fatbins used by captured
++        # graphs. Running vLLM's warmup/autotune pass again on SAVE or LOAD
++        # allocates process-dependent workspaces and breaks the deterministic
++        # VMM trajectory required by archived replay.
++        if get_graph_extension_mode() != CUDAGraphExtensionMode.NONE:
++            return None
++        return orig(worker)
++
++    gw.kernel_warmup = patched  # type: ignore[assignment]
++
++
++def _load_model_with_overlap(
++    runner, do_original_load: Callable, model_loader
++) -> torch.nn.Module:
++    """Load weights and start archived graph preparation for LOAD."""
++    mode = get_graph_extension_mode()
++    if mode == CUDAGraphExtensionMode.NONE:
++        return do_original_load()
++
++    cfg = get_config()
++    if mode == CUDAGraphExtensionMode.LOAD and not (
++        cfg is not None and cfg.recapture_on_load
++    ):
++        # Map the complete deterministic SAVE span before loading weights.
++        # Weight tensors must receive the same VMM addresses as the capture
++        # process; mapping only the tail after weight load leaves archived
++        # graph parameters pointing at a different allocation layout.
++        rt.preallocate_for_load_mode()
++    result = do_original_load()
++    from vllm.model_executor.model_loader.weight_cache.ipc_loader import IpcModelLoader
++
++    if isinstance(model_loader, IpcModelLoader):
++        rt.check_ipc_weight_layout(result)
++    if mode == CUDAGraphExtensionMode.LOAD and not (
++        cfg is not None and cfg.recapture_on_load
++    ):
++        # Build graph templates after weight loading has initialized the model.
++        from vllm.compilation.foundry_adapter.graph_ops import start_graph_builds
++
++        start_graph_builds()
++    return result
++
++
++def _patch_load_model() -> None:
++    from vllm.v1.worker.gpu import model_runner as gmr_v1
++
++    classes = [gmr_v1]
++
++    for gmr in classes:
++        cls = gmr.GPUModelRunner
++        orig = cls.load_model
++
++        @functools.wraps(orig)
++        def patched(self, *args, _orig=orig, _gmr=gmr, **kwargs):
++            if get_graph_extension_mode() == CUDAGraphExtensionMode.NONE:
++                return _orig(self, *args, **kwargs)
++
++            t0 = time.perf_counter()
++            runner = self
++            orig_get_loader = _gmr.get_model_loader
++
++            def patched_get_loader(load_config):
++                loader = orig_get_loader(load_config)
++                orig_loader_load = loader.load_model
++
++                def do_original_load():
++                    return orig_loader_load(
++                        vllm_config=runner.vllm_config,
++                        model_config=runner.model_config,
++                    )
++
++                def patched_loader_load(*_args, **_kwargs):
++                    return _load_model_with_overlap(runner, do_original_load, loader)
++
++                loader.load_model = patched_loader_load
++                return loader
++
++            _gmr.get_model_loader = patched_get_loader
++            try:
++                result = _orig(self, *args, **kwargs)
++            finally:
++                _gmr.get_model_loader = orig_get_loader
++
++            log.info(
++                "[foundry TIMING] GPUModelRunner.load_model total: %.3f s "
++                "(weight load + process_weights_after_loading + "
++                "start_graph_builds)",
++                time.perf_counter() - t0,
++            )
++            return result
++
++        cls.load_model = patched
++
++
++def _patch_memory_profiling() -> None:
++    """Run native profiling and retain the archived KV allocation geometry."""
++    import json
++    from pathlib import Path
++
++    from vllm.v1.worker.gpu_worker import Worker
++
++    orig = Worker.determine_available_memory
++
++    @functools.wraps(orig)
++    def patched(self) -> int:
++        mode = get_graph_extension_mode()
++        started = time.perf_counter()
++        available = orig(self)
++        if mode == CUDAGraphExtensionMode.NONE:
++            return available
++        log.info(
++            "[foundry] native memory profiling completed in %.3f s",
++            time.perf_counter() - started,
++        )
++        cfg = get_config()
++        assert cfg is not None and cfg.workspace_dir is not None
++        path = Path(cfg.workspace_dir) / "kv_cache_budget.json"
++        if mode == CUDAGraphExtensionMode.SAVE:
++            path.write_text(json.dumps({"available_bytes": available}))
++            return available
++        # LOAD has already mapped the archived span, including KV storage.
++        # Native profiling still runs to initialize scratch and kernel state,
++        # but its budget counts that backing again. Use SAVE's budget so native
++        # KV planning reconstructs the same cache geometry.
++        archived = int(json.loads(path.read_text())["available_bytes"])
++        log.info(
++            "[foundry] reusing archived KV budget: %d bytes (profile returned %d)",
++            archived,
++            available,
++        )
++        return archived
++
++    Worker.determine_available_memory = patched  # type: ignore[method-assign]
++
++
++def _patch_profile_cudagraph_memory() -> None:
++    """Keep the temporary graph-memory estimate out of the archive.
++
++    The runner profiles graph memory before the real capture pass. SAVE
++    would otherwise serialize temporary profile
++    graphs and LOAD would replay them with the wrong allocation lifetime.
++    """
++    from vllm.v1.worker.gpu import model_runner as gmr_v1
++
++    classes = [gmr_v1.GPUModelRunner]
++
++    for cls in classes:
++        orig = cls.profile_cudagraph_memory
++
++        @functools.wraps(orig)
++        def patched(self, *args, _orig=orig, **kwargs):
++            cfg = rt.get_config()
++            if cfg is None or cfg.mode == CUDAGraphExtensionMode.NONE:
++                return _orig(self, *args, **kwargs)
++            mode = cfg.mode
++            cfg.mode = CUDAGraphExtensionMode.NONE
++            try:
++                return _orig(self, *args, **kwargs)
++            finally:
++                cfg.mode = mode
++
++        cls.profile_cudagraph_memory = patched  # type: ignore[method-assign]
++
++
++# ---------------------------------------------------------------------------
++# GPUModelRunner.capture_model:
++#   pre-orig:  prepare_graph_capture (cuBLAS + attention workspaces land at
++#              deterministic offsets)
++#   orig:      native manager captures or restores each FULL graph.
++#   post-orig: SAVE → save_graph_manifest + pack_fatbins + capture_final_alloc_offset
++#              LOAD → empty cached allocator segments
++#              both → stop_allocation_region (post-capture allocs use the
++#                     standard CUDA allocator; only captured-graph memory
++#                     needs the deterministic VMM region)
++# ---------------------------------------------------------------------------
++
++
++def _patch_capture_model() -> None:
++    from vllm.v1.worker.gpu import model_runner as gmr_v1
++
++    classes = [gmr_v1.GPUModelRunner]
++
++    for cls in classes:
++        orig = cls.capture_model
++
++        @functools.wraps(orig)
++        def patched(
++            self,
++            *,
++            profile_only: bool = False,
++            _orig=orig,
++        ):
++            mode = get_graph_extension_mode()
++            log.info(
++                "[foundry] capture_model entered: mode=%s enforce_eager=%s "
++                "cudagraph_mode=%s",
++                mode.value,
++                self.vllm_config.model_config.enforce_eager,
++                self.compilation_config.cudagraph_mode,
++            )
++            if mode == CUDAGraphExtensionMode.NONE:
++                return _orig(self, profile_only=profile_only)
++
++            from vllm.compilation.foundry_adapter.graph_ops import (
++                pack_fatbins,
++                save_graph_manifest,
++            )
++
++            builders = [
++                b
++                for ag_list in self.attn_groups
++                for ag in ag_list
++                for b in ag.metadata_builders
++            ]
++            rt.prepare_graph_capture(
++                metadata_builders=builders,
++                device=self.device,
++                vllm_config=self.vllm_config,
++            )
++            cfg = get_config()
++            if mode == CUDAGraphExtensionMode.LOAD and not (
++                cfg is not None and cfg.recapture_on_load
++            ):
++                # Ensure template construction has started before the capture loop.
++                from vllm.compilation.foundry_adapter.graph_ops import (
++                    start_graph_builds,
++                )
++
++                start_graph_builds()
++
++            result = _orig(self, profile_only=profile_only)
++
++            if mode == CUDAGraphExtensionMode.SAVE and not profile_only:
++                save_graph_manifest()
++                pack_fatbins()
++            elif mode == CUDAGraphExtensionMode.LOAD:
++                # Restored graphs are rebuilt by Foundry at the driver level;
++                # unlike a native torch graph pool, the caching allocator does
++                # not know which cached-but-free segments are still referenced
++                # by those graphs. Return those segments before inference so a
++                # later eager allocation cannot reuse an archived graph VA.
++                torch.accelerator.empty_cache()
++                log.info("[foundry] emptied CUDA cache after LOAD graph restore")
++
++            # Only memory referenced by captured CUDA graphs needs the
++            # deterministic VMM region. Past this point (sampler warmup +
++            # inference allocations) the VMM overhead just slows things
++            # down, so switch back to the regular CUDA caching allocator.
++            from foundry import ops as fops
++
++            fops.stop_allocation_region()
++            log.info("[foundry] stopped allocation region after capture_model")
++
++            # Record the deterministic watermark on SAVE. We do this AFTER
++            # stop_allocation_region so the value reflects only the VMM cursor
++            # at end of capture — sampler warmup and any later allocations no
++            # longer advance it. Was previously a post-hook on
++            # compile_or_warm_up_model; same result, one fewer monkey-patch.
++            if mode == CUDAGraphExtensionMode.SAVE and not profile_only:
++                rt.capture_final_alloc_offset()
++
++            return result
++
++        cls.capture_model = patched  # type: ignore[method-assign]
++
++
++# ---------------------------------------------------------------------------
++# Subprocess spawn sites: LD_PRELOAD injection.
++# ---------------------------------------------------------------------------
++
++
++def _patch_subprocess_spawn_sites() -> None:
++    # Multiproc executor worker spawn.
++    from vllm.v1.executor import multiproc_executor as me
++
++    if hasattr(me.WorkerProc, "make_worker_process"):
++        orig = me.WorkerProc.make_worker_process
++
++        @functools.wraps(orig)
++        def patched(*args, **kwargs):
++            rt.setup_ld_preload_env()
++            return orig(*args, **kwargs)
++
++        me.WorkerProc.make_worker_process = staticmethod(patched)
++
++    # EngineCore proc manager.
++    from vllm.v1.engine import utils as eu
++
++    orig_init = eu.CoreEngineProcManager.__init__
++
++    @functools.wraps(orig_init)
++    def patched_init(self, *args, **kwargs):
++        rt.setup_ld_preload_env()
++        return orig_init(self, *args, **kwargs)
++
++    eu.CoreEngineProcManager.__init__ = patched_init  # type: ignore[method-assign]
++
++
++# ---------------------------------------------------------------------------
++# DeepEP buffer kwargs: use_fabric=True, num_nvl_bytes=0 on any foundry mode.
++# ---------------------------------------------------------------------------
++
++
++def _patch_deepep() -> None:
++    try:
++        from vllm.distributed.device_communicators.all2all import (
++            DeepEPLLAll2AllManager,
++        )
++    except ImportError:
++        return
++    cls = DeepEPLLAll2AllManager
++
++    orig = cls._make_all2all_kwargs
++
++    @functools.wraps(orig)
++    def patched(self, *args, **kwargs):
++        out = orig(self, *args, **kwargs)
++        if (
++            isinstance(out, dict)
++            and get_graph_extension_mode() != CUDAGraphExtensionMode.NONE
++        ):
++            if os.environ.get("FOUNDRY_DEEPEP_NVL_IPC", "0") == "1":
++                # Keep upstream's NVLink buffer (legacy cudaIpc sharing). The
++                # hook's VMM-IPC layer transports the fds via SCM_RIGHTS and
++                # maps peers at relocated VAs, which DeepEP absorbs through
++                # its buffer_ptrs_gpu device table - peer VAs are never baked
++                # into captured graphs. use_fabric stays off: fabric
++                # cuMemCreate needs IMEX, and exercising the IPC path is the
++                # point of this mode.
++                out["use_fabric"] = False
++            else:
++                # Default: force VMM-fabric buffers
++                # so the foundry cuMem hook tracks them, and disable the
++                # NVLink buffer (LL-mode uses RDMA) to avoid fabric-cuMemCreate
++                # collisions with preallocated region.
++                out["use_fabric"] = True
++                out["num_nvl_bytes"] = 0
++        return out
++
++    cls._make_all2all_kwargs = patched  # type: ignore[method-assign]
+--- a/vllm/compilation/foundry_adapter/runtime.py
++++ b/vllm/compilation/foundry_adapter/runtime.py
+@@ -0,0 +1,512 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# SPDX-FileCopyrightText: Copyright contributors to the Foundry project
++"""Runtime state, VMM memory ops, and LD_PRELOAD env setup for the
++foundry vLLM integration.
++
++Merged from former `state.py` + `lifecycle.py` + `memory.py` +
++`distributed.py`. All process-local globals and the primitives that
++touch foundry's C extension live here.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import shutil
++import time
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import TYPE_CHECKING
++
++import torch
++from foundry import ops as fops
++from foundry.allocation_region import parse_size
++
++import vllm.envs as envs
++from vllm.compilation.foundry_adapter.config import (
++    CUDAGraphExtensionMode,
++    _compute_rank_from_parallel_config,
++    get_config,
++    get_graph_extension_mode,
++    get_hook_library_path,
++    get_nvshmem_host_path,
++)
++from vllm.logger import init_logger
++
++if TYPE_CHECKING:
++    from vllm.config import ParallelConfig
++
++log = init_logger("vllm.foundry.runtime")
++
++
++# ---------------------------------------------------------------------------
++# Worker-scope state (per-process, set by setup_graph_extension)
++# ---------------------------------------------------------------------------
++
++
++@dataclass
++class CUDAGraphExtensionState:
++    capture_index: int = 0
++    # LOAD: strong-reference table keyed by GraphIdentifier. The upstream
++    # CUDAGraphWrapper stores `entry.output = weak_ref_tensors(output)`, so
++    # without a strong ref here the VMM-backed output tensors returned by
++    # `FoundryCUDAGraph.finish_one_graph_load` get GC'd between captures and
++    # the next graph replay writes to freed memory → CUDA illegal memory
++    # access. Do not remove.
++    loaded_graphs: dict = field(default_factory=dict)
++
++
++_state: CUDAGraphExtensionState | None = None
++_capture_active = False
++
++
++def set_capture_active(active: bool) -> None:
++    global _capture_active
++    _capture_active = active
++
++
++def is_capture_active() -> bool:
++    return _capture_active
++
++
++def get_state() -> CUDAGraphExtensionState | None:
++    return _state
++
++
++# ---------------------------------------------------------------------------
++# VMM region setup (called from patched init_worker_distributed_environment)
++# ---------------------------------------------------------------------------
++
++
++def prepare_weight_cache_daemon(config_path: str, local_rank: int) -> tuple[int, int]:
++    """Allocate exportable VMM weights for later Foundry IPC engines.
++
++    Give the daemon a region disjoint from the engine's so the stock IPC hook
++    can map weights at their exporter addresses. Legacy CUDA IPC mappings have
++    process-dependent addresses and cannot be embedded in a reusable archive.
++    """
++    from vllm.compilation.foundry_adapter.config import CUDAGraphExtensionConfig
++
++    cfg = CUDAGraphExtensionConfig.from_toml(config_path)
++    if cfg.mode != CUDAGraphExtensionMode.SAVE:
++        raise ValueError("Graph preparation requires a Foundry SAVE configuration")
++    if cfg.weight_cache_size is None:
++        raise ValueError("Set Foundry weight_cache_size for the daemon's weight pool")
++    torch.accelerator.set_device_index(local_rank)
++    region_size = parse_size(cfg.region_size)
++    daemon_base = cfg.base_addr - region_size
++    if daemon_base <= 0:
++        raise ValueError("Foundry base_addr must leave room for the daemon region")
++    fops.set_allocation_region(daemon_base, region_size)
++    pool_size = parse_size(cfg.weight_cache_size)
++    if pool_size <= 0 or pool_size > region_size:
++        raise ValueError("weight_cache_size must be positive and fit in region_size")
++    # Small cuMemAddressReserve requests can ignore the requested address.
++    # A single large exported chunk avoids one reservation per Torch storage.
++    if not fops.preallocate_region(pool_size):
++        raise RuntimeError("Failed to preallocate the daemon's Foundry weight pool")
++    # The temporary engines own graph/module archives. The persistent daemon
++    # only exports weights, and must not publish artifacts into their archive.
++    fops.set_pack_fatbins_on_exit(False)
++    log.info("[foundry] weight daemon initialized exportable VMM allocations")
++    return daemon_base, daemon_base + pool_size
++
++
++def check_ipc_weight_layout(model: torch.nn.Module) -> None:
++    """Reject archived kernels whose external weight pointers have changed."""
++    cfg = get_config()
++    assert cfg is not None and cfg.workspace_dir is not None
++    path = Path(cfg.workspace_root) / (
++        f"{Path(cfg.workspace_dir).name}_ipc_weight_layout.json"
++    )
++    tensors = [*model.named_parameters(), *model.named_buffers()]
++    layout = {
++        name: {
++            "address": tensor.data_ptr(),
++            "shape": list(tensor.shape),
++            "stride": list(tensor.stride()),
++            "dtype": str(tensor.dtype),
++        }
++        for name, tensor in tensors
++        if tensor.is_cuda
++    }
++    if cfg.mode == CUDAGraphExtensionMode.SAVE:
++        path.write_text(json.dumps(layout, sort_keys=True), encoding="utf-8")
++    elif cfg.mode == CUDAGraphExtensionMode.LOAD:
++        saved = json.loads(path.read_text(encoding="utf-8"))
++        if saved != layout:
++            changed = sorted(
++                name
++                for name in saved.keys() | layout.keys()
++                if saved.get(name) != layout.get(name)
++            )
++            raise RuntimeError(
++                "Foundry IPC weight layout changed before graph restoration: "
++                f"{changed[:3]}. Prepare the weight daemon with the Foundry "
++                "SAVE configuration before preparing graphs."
++            )
++        log.info("[foundry] validated IPC weight layout (%d tensors)", len(layout))
++
++
++def setup_graph_extension(parallel_config: ParallelConfig) -> None:
++    """VMM region + (LOAD only) CUDA modules. Called BEFORE NCCL."""
++    global _state
++    cfg = get_config()
++    if cfg is None or cfg.mode == CUDAGraphExtensionMode.NONE:
++        return
++
++    t_total = time.perf_counter()
++    rank = _compute_rank_from_parallel_config(parallel_config)
++    workspace_dir = Path(cfg.workspace_root) / f"rank_{rank}"
++    cfg.workspace_dir = str(workspace_dir)
++    log.info("[foundry] rank=%d workspace_dir=%s", rank, workspace_dir)
++
++    if cfg.mode == CUDAGraphExtensionMode.SAVE:
++        if workspace_dir.exists():
++            shutil.rmtree(workspace_dir)
++        workspace_dir.mkdir(parents=True, exist_ok=True)
++
++    elif cfg.mode == CUDAGraphExtensionMode.LOAD:
++        fops.set_skip_fatbin_processing(True)
++        if not workspace_dir.exists():
++            # rank_0 fallback is only safe for single-rank setups.
++            # Under TP/PP/DP > 1 each rank has its own device addresses,
++            # so loading rank 0's graphs on rank N would produce wrong
++            # pointers and likely crash on first replay.
++            is_single_rank = (
++                parallel_config.tensor_parallel_size == 1
++                and parallel_config.pipeline_parallel_size == 1
++                and parallel_config.data_parallel_size == 1
++                and parallel_config.nnodes == 1
++            )
++            fallback = Path(cfg.workspace_root) / "rank_0"
++            if is_single_rank and fallback.exists():
++                log.warning(
++                    "Workspace %s missing; falling back to %s (safe only for "
++                    "single-rank setups)",
++                    workspace_dir,
++                    fallback,
++                )
++                cfg.workspace_dir = str(fallback)
++            else:
++                raise RuntimeError(
++                    f"Workspace for rank {rank} ({workspace_dir}) does not "
++                    f"exist. For multi-rank LOAD, re-run SAVE with the same "
++                    f"parallelism topology."
++                )
++        log.info("[foundry] LOAD: loading CUDA modules from %s", cfg.workspace_dir)
++        t = time.perf_counter()
++        fops.load_cuda_modules_and_libraries(cfg.workspace_dir)
++        log.info(
++            "[foundry TIMING] load_cuda_modules_and_libraries: %.3f s",
++            time.perf_counter() - t,
++        )
++
++    # set_allocation_region MUST come after load_cuda_modules (which does
++    # cuCtxCreate).
++    region_size = parse_size(cfg.region_size)
++    log.info(
++        "[foundry] Setting up VMM region at %s size %s",
++        hex(cfg.base_addr),
++        cfg.region_size,
++    )
++    fops.set_allocation_region(cfg.base_addr, region_size)
++    # NOTE(liuxs): workspace init is in prepare_graph_capture
++    # # Bring cuBLAS handle up so its tiny bring-up lands in scratch.
++    # _ = torch._C._cuda_getCurrentBlasHandle()
++
++    _state = CUDAGraphExtensionState()
++    log.info(
++        "[foundry TIMING] setup_graph_extension total: %.3f s",
++        time.perf_counter() - t_total,
++    )
++
++
++def skip_to_scratch_boundary() -> None:
++    """Advance allocator past scratch region. Called AFTER NCCL."""
++    cfg = get_config()
++    if cfg is None or cfg.mode == CUDAGraphExtensionMode.NONE:
++        return
++    scratch = parse_size(cfg.scratch_space_size)
++    current = fops.get_current_alloc_offset()
++    if current > scratch:
++        log.warning(
++            "[foundry] Current offset %d > scratch_space_size %d. Increase "
++            "scratch_space_size.",
++            current,
++            scratch,
++        )
++        return
++    log.info(
++        "[foundry] Skip to scratch boundary: %d bytes (current was %d)",
++        scratch,
++        current,
++    )
++    fops.set_current_alloc_offset(scratch)
++
++
++def capture_final_alloc_offset() -> int:
++    """Record per-rank watermark after all graph captures on SAVE."""
++    cfg = get_config()
++    offset = fops.get_current_alloc_offset()
++    log.info(
++        "[foundry] Captured final_alloc_offset: %d bytes (%.2f GB)",
++        offset,
++        offset / (1024**3),
++    )
++    if cfg is not None and cfg.workspace_dir is not None:
++        path = os.path.join(cfg.workspace_dir, "final_alloc_offset.json")
++        # Persist the live VMM ranges, not only the cursor watermark.  A
++        # contiguous preallocation can end in the middle of a CUDA allocator
++        # segment; LOAD would then try to map an overlapping tail and either
++        # fall back to a different address or corrupt the restored graph.
++        ranges = fops.get_live_region_ranges()
++        with open(path, "w") as f:
++            json.dump(
++                {
++                    "final_alloc_offset": offset,
++                    "live_ranges": ranges,
++                },
++                f,
++            )
++        log.info("[foundry] Saved per-rank final_alloc_offset to %s", path)
++    return offset
++
++
++# ---------------------------------------------------------------------------
++# VMM preallocation (LOAD only)
++# ---------------------------------------------------------------------------
++
++
++def preallocate_for_load_mode() -> None:
++    """One cuMemCreate + cuMemMap covering the deterministic region."""
++    cfg = get_config()
++    if cfg is None or cfg.mode != CUDAGraphExtensionMode.LOAD:
++        return
++
++    # Each rank records its own archived allocation span.
++    final = 0
++    live_ranges = None
++    if cfg.workspace_dir is not None:
++        p = os.path.join(cfg.workspace_dir, "final_alloc_offset.json")
++        if os.path.exists(p):
++            with open(p) as f:
++                data = json.load(f)
++                final = data.get("final_alloc_offset", 0)
++                live_ranges = data.get("live_ranges")
++    if final <= 0:
++        return
++
++    current = fops.get_current_alloc_offset()
++    remaining = final - current
++    if remaining <= 0:
++        log.info("[foundry] LOAD: no preallocation needed")
++        return
++
++    log.info(
++        "[foundry] LOAD: preallocating %d bytes (%.2f GB)",
++        remaining,
++        remaining / (1024**3),
++    )
++    t = time.perf_counter()
++    # Graph kernel parameters can retain pointers to temporary workspaces that
++    # were freed after SAVE capture.  ``live_ranges`` intentionally excludes
++    # those allocations, so mapping only the live set leaves their addresses
++    # backed by unmapped or unrelated memory on LOAD.  This call runs before
++    # weight restoration, while the deterministic region is still empty after
++    # the scratch boundary, so the complete span can be mapped safely and all
++    # archived graph pointers remain valid.
++    ok = fops.preallocate_region(remaining)
++    if not ok and live_ranges is not None:
++        ranges = [
++            (int(offset), int(size))
++            for offset, size in live_ranges
++            if int(offset) + int(size) > current and int(offset) < final
++        ]
++        log.warning(
++            "[foundry] LOAD: full-span preallocation failed; falling back to "
++            "live ranges (archived temporary pointers may be unavailable)"
++        )
++        ok = fops.preallocate_ranges(ranges, final)
++    if ok:
++        log.info("[foundry TIMING] preallocate_region: %.3f s", time.perf_counter() - t)
++    else:
++        log.warning("[foundry] preallocate_region failed for %d bytes", remaining)
++
++
++# ---------------------------------------------------------------------------
++# Graph-capture workspace pinning (SAVE + LOAD)
++# ---------------------------------------------------------------------------
++
++
++def _preallocate_attention_workspaces(metadata_builders: list | None) -> None:
++    try:
++        from vllm.v1.attention.backends.flashinfer import (
++            FlashInferMetadataBuilder,
++            _get_trtllm_workspace_buffer,
++        )
++    except ImportError:
++        return
++    _get_trtllm_workspace_buffer()
++    if metadata_builders:
++        for b in metadata_builders:
++            if isinstance(b, FlashInferMetadataBuilder):
++                b._get_workspace_buffer()
++
++
++def _preallocate_flashinfer_allreduce_workspaces(vllm_config) -> None:
++    """Create communication workspaces before restoring captured graphs.
++
++    LOAD skips the compilation warmup that normally creates these lazily.  A
++    restored graph can still reference the workspace, so it must be created at
++    the same point in the deterministic allocation sequence as SAVE.
++    """
++    if not envs.VLLM_ALLREDUCE_USE_FLASHINFER:
++        return
++    try:
++        from vllm.compilation.passes.fusion.allreduce_rms_fusion import (
++            get_fi_ar_quant_workspace,
++            get_fi_ar_workspace,
++        )
++        from vllm.distributed.parallel_state import (
++            get_tensor_model_parallel_rank,
++            get_tp_group,
++        )
++
++        tp_size = vllm_config.parallel_config.tensor_parallel_size
++        max_size = vllm_config.compilation_config.pass_config.flashinfer_max_size(
++            tp_size
++        )
++        if max_size is None or tp_size <= 1:
++            return
++        hidden_dim = vllm_config.model_config.get_hidden_size()
++        dtype = vllm_config.model_config.dtype
++        element_size = torch.empty((), dtype=dtype, device="cpu").element_size()
++        max_token_num = max_size // (hidden_dim * element_size)
++        kwargs = dict(
++            world_size=tp_size,
++            rank=get_tensor_model_parallel_rank(),
++            max_token_num=max_token_num,
++            hidden_dim=hidden_dim,
++            dtype=dtype,
++            group=get_tp_group().cpu_group,
++        )
++        get_fi_ar_workspace(**kwargs)
++        get_fi_ar_quant_workspace(**kwargs)
++    except (ImportError, AttributeError, TypeError, ValueError) as e:
++        log.debug(
++            "[foundry] FlashInfer all-reduce workspace preallocation skipped: %s",
++            e,
++        )
++
++
++def _eager_inductor_lazy_init(device: torch.device) -> None:
++    """Pre-fire `torch._inductor.fx_passes.joint_graph.lazy_init` outside
++    any CUDA-graph capture window.
++
++    The first in-capture compile inside `capture_model` triggers
++    `joint_graph.lazy_init` which calls `_sfdp_init` — that builds SDPA
++    pattern templates by copying CPU constants onto the device, which is
++    illegal inside a capture window:
++
++        RuntimeError: Cannot copy between CPU and CUDA tensors during CUDA
++        graph capture unless the CPU tensor is pinned.
++
++    Pre-warming retires the lazy init before capture starts.
++
++    Why only `joint_graph` and not the other `lazy_init` functions in
++    `torch._inductor.fx_passes.*`: `post_grad.lazy_init` and friends
++    are also `@init_once_fakemode` (`@functools.cache`-keyed on
++    `input_device`), but inductor's own `post_grad_passes` calls them
++    with **no argument** (`input_device=None`). If we pre-warm with the
++    indexed `cuda:N` device the cache keys don't match, both calls run,
++    and they re-register the same patterns:
++
++        torch._inductor.exc.InductorError: Duplicate pattern: amax_default
++
++    Only `joint_graph.lazy_init` is dangerous to leave for capture-time
++    (its body actually allocates on the device); the others just register
++    patterns and are safe to leave to inductor.
++    """
++    try:
++        from torch._inductor.fx_passes.joint_graph import lazy_init
++    except Exception as e:
++        log.debug("[foundry] joint_graph.lazy_init not importable: %s", e)
++        return
++    try:
++        lazy_init(device)
++    except Exception as e:
++        log.debug("[foundry] joint_graph.lazy_init(%s) skipped: %s", device, e)
++
++
++def prepare_graph_capture(
++    metadata_builders: list | None = None,
++    device: torch.device | None = None,
++    vllm_config=None,
++) -> None:
++    """Force cuBLAS + attention workspaces to land at deterministic offsets,
++    and pre-warm torch._inductor's pattern-matcher lazy init so the first
++    in-capture compile doesn't try to copy CPU tensors onto the device.
++
++    `device` is the model_runner's device; passing it lets the inductor
++    lazy-init cache key match the in-capture compile path.
++    """
++    import foundry as foundry_pkg
++
++    if device is not None:
++        _eager_inductor_lazy_init(device)
++    fops.preallocate_cublas_workspaces()
++    if vllm_config is not None:
++        _preallocate_flashinfer_allreduce_workspaces(vllm_config)
++    _preallocate_attention_workspaces(metadata_builders)
++    if foundry_pkg.graph.default_capture_stream is None:
++        foundry_pkg.graph.default_capture_stream = torch.cuda.Stream()
++    with torch.cuda.stream(foundry_pkg.graph.default_capture_stream):
++        fops.preallocate_cublas_workspaces()
++        _preallocate_attention_workspaces(metadata_builders)
++
++
++# ---------------------------------------------------------------------------
++# Subprocess env setup (LD_PRELOAD + FOUNDRY_MODE consumed by foundry/csrc/hook.cpp)
++# ---------------------------------------------------------------------------
++
++
++def setup_ld_preload_env() -> None:
++    """Mutate os.environ so child processes inherit the foundry hook.
++
++    Idempotent, non-restoring — keeps the mutation for the parent's
++    lifetime. Called from patched subprocess-spawn sites.
++
++    Also stamps `FOUNDRY_SPAWN_T0_NS` right before the child fork so
++    the child can log `spawn → install_hooks` wall time (dominated by
++    Python + torch + vllm cold import with LD_PRELOAD'd hook).
++    """
++    current = os.environ.get("LD_PRELOAD", "")
++    hook = get_hook_library_path()
++    if hook and hook not in current:
++        current = f"{hook}:{current}" if current else hook
++    nvs = get_nvshmem_host_path()
++    if nvs and nvs not in current:
++        current = f"{nvs}:{current}" if current else nvs
++    if current:
++        os.environ["LD_PRELOAD"] = current
++
++    mode = get_graph_extension_mode()
++    if mode != CUDAGraphExtensionMode.NONE:
++        os.environ["FOUNDRY_MODE"] = mode.value
++
++    # Early region reserve: on LOAD the hook claims [base, base+region_size)
++    # right after context creation, before module loading can trigger the
++    # CUDA driver's lazily-placed VA arena. Size must equal region_size
++    # exactly so setup_graph_extension's set_allocation_region call is an
++    # idempotent no-op against the early reservation.
++    cfg = get_config()
++    if cfg is not None and mode != CUDAGraphExtensionMode.NONE:
++        os.environ["FOUNDRY_EARLY_RESERVE_BASE"] = hex(cfg.base_addr)
++        os.environ["FOUNDRY_EARLY_RESERVE_SIZE"] = str(parse_size(cfg.region_size))
++
++    # Overwrite every spawn site — child reads it on entry.
++    os.environ["FOUNDRY_SPAWN_T0_NS"] = str(time.perf_counter_ns())
++
++    log.info("[foundry] LD_PRELOAD set (mode=%s)", mode.value)
+--- a/vllm/config/compilation.py
++++ b/vllm/config/compilation.py
+@@ -714,6 +714,9 @@
+     local_cache_dir: str = field(default=None, init=False)  # type: ignore
+     """local cache dir for each rank"""
+ 
++    graph_extension_config_path: str | None = None
++    """Optional Foundry CUDA Graph persistence configuration."""
++
+     fast_moe_cold_start: bool | None = None
+     """Optimization for fast MOE cold start.
+ 
+@@ -1063,6 +1066,11 @@
+         if self.backend == "":
+             self.backend = current_platform.get_compile_backend()
+ 
++        if self.graph_extension_config_path:
++            from vllm.compilation.foundry_adapter import install_hooks
++
++            install_hooks(self)
++
+     def init_backend(
+         self,
+         vllm_config: "VllmConfig",
+--- a/vllm/compilation/decorators.py
++++ b/vllm/compilation/decorators.py
+@@ -387,11 +387,17 @@
+         enable_compile = enable_if is None or enable_if(vllm_config)
+         # for CompilationMode.STOCK_TORCH_COMPILE , the upper level model runner
+         # will handle the compilation, so we don't need to do anything here.
++        from vllm.compilation.foundry_adapter import (
++            CUDAGraphExtensionMode,
++            get_graph_extension_mode,
++        )
++
+         self.do_not_compile = (
+             self.compilation_config.mode
+             in [CompilationMode.NONE, CompilationMode.STOCK_TORCH_COMPILE]
+             or _should_ignore_torch_compile(self.__class__)
+             or not enable_compile
++            or get_graph_extension_mode() == CUDAGraphExtensionMode.LOAD
+         )
+         if self.do_not_compile:
+             return
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -125,6 +125,10 @@
+         load_general_plugins()
+ 
+         self.vllm_config = vllm_config
++        if vllm_config.compilation_config.graph_extension_config_path:
++            from vllm.compilation.foundry_adapter import install_hooks
++
++            install_hooks(vllm_config.compilation_config)
+         if not vllm_config.parallel_config.data_parallel_rank_local:
+             logger.info(
+                 "Initializing a V1 LLM engine (v%s) with config: %s",
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -196,6 +196,11 @@
+             is_driver_worker=is_driver_worker,
+         )
+ 
++        if vllm_config.compilation_config.graph_extension_config_path:
++            from vllm.compilation.foundry_adapter import install_hooks
++
++            install_hooks(vllm_config.compilation_config)
++
+         # configure float32 matmul precision according to vLLM env.
+         precision = envs.VLLM_FLOAT32_MATMUL_PRECISION
+         torch.set_float32_matmul_precision(precision)
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -7,7 +7,7 @@
+ from contextlib import ExitStack
+ from dataclasses import dataclass, replace
+ from itertools import groupby, product
+-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
++from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, TypeAlias, cast
+ 
+ import torch
+ import torch.nn as nn
+@@ -59,6 +59,11 @@
+     slot_mappings: dict[str, torch.Tensor]
+ 
+ 
++CaptureOutput: TypeAlias = (
++    torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors | None
++)
++
++
+ @dataclass(frozen=True)
+ class BatchExecutionDescriptor:
+     """Describes the shape of the batch and CG mode to run; this is used to make shape
+@@ -97,7 +102,7 @@
+         self,
+         desc: BatchExecutionDescriptor,
+         warmup: bool,
+-    ) -> Callable[[CUDAGraphMode], None]: ...
++    ) -> Callable[[CUDAGraphMode], CaptureOutput]: ...
+ 
+ 
+ def _is_compatible(
+@@ -171,6 +176,8 @@
+         self._lora_dispatch_map, self._max_lora_case = self._build_lora_dispatch_map()
+ 
+         self.graphs: dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph] = {}
++        # Keep restored output buffers alive for the lifetime of each graph.
++        self._graph_outputs: dict[BatchExecutionDescriptor, CaptureOutput] = {}
+         self.pool = current_platform.get_global_graph_pool() if cudagraph_mode else None
+ 
+         self._graphs_captured = False
+@@ -461,26 +468,67 @@
+                         assert desc not in self.graphs, (
+                             f"Graph already captured for {desc}"
+                         )
+-                        graph = torch.cuda.CUDAGraph()
+-                        # Sync offloader's copy stream before capture.
+-                        # Ensure any pre-capture prefetches from offloader are complete.
+-                        get_offloader().sync_prev_onload()
++                        from vllm.compilation.foundry_adapter import (
++                            CUDAGraphExtensionMode,
++                            get_graph_extension_mode,
++                        )
++
++                        extension_mode = get_graph_extension_mode()
+                         if self.pool is not None:
+                             set_graph_pool_id(self.pool)
+                         else:
+                             set_graph_pool_id(current_platform.graph_pool_handle())
+-                        if self._capture_mem_samples is not None:
+-                            torch.accelerator.synchronize()
+-                            free_before = torch.accelerator.get_memory_info()[0]
+-                        with torch.cuda.graph(
+-                            graph, self.pool, stream=self._capture_stream(desc)
+-                        ):
+-                            forward_fn(CUDAGraphMode.NONE)
+-                            # Join offloader's copy stream after forward to avoid
+-                            # unjoined stream error. The last layer's start_prefetch
+-                            # forks copy_stream, but wait_prefetch only happens in
+-                            # the next forward pass.
+-                            get_offloader().join_after_forward()
++                        if extension_mode == CUDAGraphExtensionMode.NONE:
++                            graph = torch.cuda.CUDAGraph()
++                            # Sync offloader's copy stream before capture.
++                            # Ensure any pre-capture prefetches from offloader
++                            # are complete.
++                            get_offloader().sync_prev_onload()
++                            if self._capture_mem_samples is not None:
++                                torch.accelerator.synchronize()
++                                free_before = torch.accelerator.get_memory_info()[0]
++                            with torch.cuda.graph(
++                                graph, self.pool, stream=self._capture_stream(desc)
++                            ):
++                                forward_fn(CUDAGraphMode.NONE)
++                                # Join offloader's copy stream after forward to
++                                # avoid unjoined stream error.
++                                get_offloader().join_after_forward()
++                        else:
++                            # Foundry SAVE/LOAD (PR #66472 rebased on 0.31.0):
++                            # capture_or_load_graph replaces the capture stanza.
++                            from vllm.compilation.foundry_adapter.graph_ops import (
++                                capture_or_load_graph,
++                            )
++
++                            if self._capture_mem_samples is not None:
++                                torch.accelerator.synchronize()
++                                free_before = torch.accelerator.get_memory_info()[0]
++
++                            graph, loaded_output = capture_or_load_graph(
++                                batch_descriptor=BatchDescriptor(
++                                    num_tokens=desc.num_tokens,
++                                    num_reqs=desc.num_reqs,
++                                    uniform=desc.uniform_token_count is not None,
++                                    num_active_loras=desc.num_active_loras,
++                                ),
++                                runnable=lambda forward_fn=forward_fn: forward_fn(
++                                    CUDAGraphMode.NONE
++                                ),
++                                weak_ref_output=False,
++                                runtime_mode=desc.cg_mode,
++                                graph_pool=self.pool,
++                            )
++                            # LOAD returns the output buffer restored from the
++                            # archive; SAVE returns the buffer populated by the
++                            # captured forward closure.
++                            self._graph_outputs[desc] = cast(
++                                CaptureOutput, loaded_output
++                            )
++                            if extension_mode == CUDAGraphExtensionMode.LOAD:
++                                logger.info(
++                                    "[foundry] restored graph descriptor=%s", desc
++                                )
+                         if self._capture_mem_samples is not None:
+                             torch.accelerator.synchronize()
+                             free_after = torch.accelerator.get_memory_info()[0]
+@@ -583,6 +631,7 @@
+         self.aux_hidden_states: list[torch.Tensor] = []
+         self.use_aux_hidden_state_outputs = False
+         self.intermediate_tensors: IntermediateTensors | None = None
++        # Each restored graph has its own output address.
+ 
+     def capture(
+         self,
+@@ -614,8 +663,36 @@
+                 "Set VLLM_USE_BREAKABLE_CUDAGRAPH=1 or cudagraph_mode=NONE/FULL."
+             )
+ 
+-        def store_capture_output(num_tokens: int, model_output: Any) -> None:
++        def store_capture_output(num_tokens: int, model_output: Any) -> CaptureOutput:
+             """Copy outputs to persistent buffers, allocating on first use."""
++            # Foundry LOAD reconstructs output tensors from their recorded
++            # addresses.  Do not allocate the runner output during the
++            # eager warmup before capture; that would place it in the regular
++            # CUDA allocator instead of the deterministic VMM region.
++            extension_path = (
++                self.vllm_config.compilation_config.graph_extension_config_path
++            )
++            if extension_path:
++                from vllm.compilation.foundry_adapter import (
++                    CUDAGraphExtensionMode,
++                    get_graph_extension_mode,
++                )
++
++            if (
++                extension_path
++                and get_graph_extension_mode() != CUDAGraphExtensionMode.NONE
++            ):
++                output_buffer = (
++                    self.hidden_states
++                    if self.is_last_pp_rank
++                    else self.intermediate_tensors
++                )
++                from vllm.compilation.foundry_adapter.runtime import (
++                    is_capture_active,
++                )
++
++                if output_buffer is None and not is_capture_active():
++                    return None
+             if self.is_last_pp_rank:
+                 # Last PP rank (common case).
+                 if self.use_aux_hidden_state_outputs:
+@@ -632,6 +709,9 @@
+                     ]
+                 for i, aux in enumerate(aux_hidden_states):
+                     self.aux_hidden_states[i][:num_tokens] = aux
++                if self.use_aux_hidden_state_outputs:
++                    return self.hidden_states, self.aux_hidden_states
++                return self.hidden_states
+             else:
+                 # Non-last PP rank.
+                 assert isinstance(model_output, IntermediateTensors)
+@@ -642,10 +722,11 @@
+                     )
+                 for k, v in intermediate_tensors.tensors.items():
+                     self.intermediate_tensors[k][:num_tokens] = v
++                return self.intermediate_tensors
+ 
+         def create_forward_fn(
+             desc: BatchExecutionDescriptor, warmup: bool
+-        ) -> Callable[[CUDAGraphMode], None]:
++        ) -> Callable[[CUDAGraphMode], CaptureOutput]:
+             num_tokens = desc.num_tokens
+             num_reqs = desc.num_reqs or min(num_tokens, self.max_num_reqs)
+ 
+@@ -688,11 +769,11 @@
+                     model, model_inputs, ubatch_state, for_capture=True
+                 )
+ 
+-                def ubatch_forward_fn(cg_mode: CUDAGraphMode) -> None:
++                def ubatch_forward_fn(cg_mode: CUDAGraphMode) -> CaptureOutput:
+                     assert cg_mode != CUDAGraphMode.PIECEWISE, (
+                         "DBO does not support PIECEWISE cudagraphs"
+                     )
+-                    store_capture_output(num_tokens, finish())
++                    return store_capture_output(num_tokens, finish())
+ 
+                 return ubatch_forward_fn
+ 
+@@ -712,7 +793,7 @@
+             # Capture with dummy rows marked as padding.
+             input_buffers.is_padding.fill_(True)
+ 
+-            def forward_fn(cg_mode: CUDAGraphMode) -> None:
++            def forward_fn(cg_mode: CUDAGraphMode) -> CaptureOutput:
+                 batch_descriptor = None
+                 if cg_mode == CUDAGraphMode.PIECEWISE:
+                     batch_descriptor = BatchDescriptor(
+@@ -742,7 +823,7 @@
+                     # model outputs. No need to keep track of the hidden states.
+                     return None
+ 
+-                store_capture_output(num_tokens, model_output)
++                return store_capture_output(num_tokens, model_output)
+ 
+             return forward_fn
+ 
+@@ -753,6 +834,19 @@
+     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors:
+         """Replay a captured FULL cudagraph and return hidden states."""
+         super().run_fullgraph(desc)
++        graph_output = self._graph_outputs.get(desc)
++        if graph_output is not None:
++            if not self.is_last_pp_rank:
++                assert isinstance(graph_output, IntermediateTensors)
++                return graph_output[: desc.num_tokens]
++            if not self.use_aux_hidden_state_outputs:
++                assert isinstance(graph_output, torch.Tensor)
++                return graph_output[: desc.num_tokens]
++            assert isinstance(graph_output, tuple)
++            hidden_states, aux_hidden_states = graph_output
++            return hidden_states[: desc.num_tokens], [
++                x[: desc.num_tokens] for x in aux_hidden_states
++            ]
+         if not self.is_last_pp_rank:
+             assert self.intermediate_tensors is not None
+             return self.intermediate_tensors[: desc.num_tokens]
