@@ -51,6 +51,14 @@ class CUDAGraphExtensionConfig:
     # - skip the per-size eager warmup forward before each capture/restore.
     skip_cudagraph_memory_profile: bool = False
     skip_capture_warmup: bool = False
+    # Skip vLLM 0.31 V2 ``warmup_kernels`` (eager prefill + 3 decode + mixed steps
+    # over up to max_num_seqs requests). Next to a serving engine its eager,
+    # collective-heavy forwards stall serving. Must match on SAVE and LOAD.
+    skip_jit_warmup: bool = False
+    # Skip the runner's memory-profiling forward (one eager max_num_batched_tokens
+    # forward + dummy sampler). Only valid with a fixed KV geometry
+    # (num_gpu_blocks_override); LOAD reuses SAVE's archived KV budget. Must match.
+    skip_profile_run: bool = False
     # Scratch space reserved for non-deterministic NCCL allocations.
     # After skip_to_scratch_boundary(), allocations start from
     # base_addr + scratch_space_size.
@@ -92,6 +100,8 @@ class CUDAGraphExtensionConfig:
                 data.get("skip_cudagraph_memory_profile", False)
             ),
             skip_capture_warmup=bool(data.get("skip_capture_warmup", False)),
+            skip_jit_warmup=bool(data.get("skip_jit_warmup", False)),
+            skip_profile_run=bool(data.get("skip_profile_run", False)),
         )
 
     @staticmethod

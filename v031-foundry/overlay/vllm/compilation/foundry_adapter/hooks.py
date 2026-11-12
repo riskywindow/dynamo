@@ -147,6 +147,8 @@ def install_hooks(compilation_config: CompilationConfig) -> None:
 
     _patch_init_worker_distributed_environment()
     _patch_kernel_warmup()
+    _patch_jit_warmup()
+    _patch_profile_run()
     _patch_load_model()
     _patch_capture_model()
     _patch_profile_cudagraph_memory()
@@ -216,6 +218,63 @@ def _patch_kernel_warmup() -> None:
         return orig(worker)
 
     gw.kernel_warmup = patched  # type: ignore[assignment]
+
+
+def _patch_jit_warmup() -> None:
+    """Time vLLM 0.31's V2 ``warmup_kernels`` and, with ``skip_jit_warmup``, skip it.
+
+    The pass runs ~6 eager forwards (a 2 x max_num_seqs-token prefill, 3 decode
+    steps over max_num_seqs requests, a mixed and a cleanup step) before graph
+    capture. Every eager forward with collectives costs a serving engine on the
+    same GPUs about one time slice per collective, so this pass is where a lean
+    LOAD shadow stalls serving. Skipping must be matched on SAVE and LOAD to keep
+    the deterministic allocation trajectory; capture locks the workspace after.
+    """
+    import vllm.v1.worker.gpu_worker as gw
+
+    orig = getattr(gw, "warmup_kernels", None)
+    if orig is None:
+        return
+
+    @functools.wraps(orig)
+    def patched(*args, **kwargs):
+        cfg = rt.get_config()
+        active = cfg is not None and cfg.mode != CUDAGraphExtensionMode.NONE
+        if active and cfg.skip_jit_warmup:
+            log.info("[foundry] lean: skipped warmup_kernels (mode=%s)", cfg.mode.value)
+            return None
+        t = time.perf_counter()
+        log.info("[foundry] warmup_kernels start")
+        try:
+            return orig(*args, **kwargs)
+        finally:
+            log.info("[foundry TIMING] warmup_kernels: %.3f s", time.perf_counter() - t)
+
+    gw.warmup_kernels = patched  # type: ignore[assignment]
+
+
+def _patch_profile_run() -> None:
+    """With ``skip_profile_run``, skip the memory-profiling forward on SAVE and LOAD.
+
+    The forward (max_num_batched_tokens tokens, attention skipped, plus a dummy
+    sampler) only measures peak activation memory for the KV budget. With a fixed
+    KV geometry that budget is not needed, and LOAD reuses SAVE's archived budget,
+    but the forward's collectives stall a serving engine on the same GPUs.
+    """
+    from vllm.v1.worker.gpu import model_runner as gmr_v1
+
+    cls = gmr_v1.GPUModelRunner
+    orig = cls.profile_run
+
+    @functools.wraps(orig)
+    def patched(self, *args, **kwargs):
+        cfg = rt.get_config()
+        if cfg is not None and cfg.mode != CUDAGraphExtensionMode.NONE and cfg.skip_profile_run:
+            log.info("[foundry] lean: skipped profile_run (mode=%s)", cfg.mode.value)
+            return None
+        return orig(self, *args, **kwargs)
+
+    cls.profile_run = patched  # type: ignore[method-assign]
 
 
 def _load_model_with_overlap(
