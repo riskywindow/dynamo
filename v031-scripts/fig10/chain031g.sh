@@ -1,5 +1,5 @@
 #!/bin/bash
-# chain031g.sh NCYC [RATE] [DUR]: chain031.sh foundry cycles with a pre-started, gated spare (F10_GATE).
+# chain031g.sh NCYC [RATE] [DUR] (K0=<first cycle index>, default 1; cycle k uses seed 20261107 + 101*(k-1)): chain031.sh foundry cycles with a pre-started, gated spare (F10_GATE).
 # Ports rotate between serving, parked (sleeping lean-Foundry shadow) and gated (lean-Foundry shadow held after weight
 # attach). Cycle k (seed 20261107 + 101*(k-1)): at t0+120 s SIGKILL serving; proxy -> parked, wake it (promotion);
 # release the gated spare's gate (rep_start), wait until it serves, park it (rep_parked); then pre-start a new gated
@@ -22,7 +22,8 @@ start_gated $GPORT $GLOG $GGATE || { echo "initial gated spare failed"; exit 1; 
 pkill -f "[p]roxy.py 9000"; echo $SPORT > /tmp/f10_target
 setsid python3 $F/proxy.py 9000 /tmp/f10_target > /dev/null 2>&1 < /dev/null &
 sleep 1
-for k in $(seq $NC); do
+K0=${K0:-1}
+for k in $(seq $K0 $((K0 + NC - 1))); do
   SEED=$((20261107 + 101 * (k - 1))); O=$F/arms/gated-c$k; rm -rf $O; mkdir -p $O
   ev() { echo "$1 $(date +%s.%N)" >> $O/events.txt; }
   echo "serving=$SPORT parked=$PPORT gated=$GPORT seed=$SEED" > $O/roles.txt
