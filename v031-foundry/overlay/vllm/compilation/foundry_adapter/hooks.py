@@ -38,9 +38,18 @@ _INSTALLED = False
 
 
 def _reset_install_state_after_fork() -> None:
-    """Reinstall hooks in a worker forked after the engine process."""
-    global _INSTALLED
-    _INSTALLED = False
+    """Reinstall hooks in a worker forked after the engine process.
+
+    A child forked from a process that already installed the hooks inherits
+    every patch (patched functions, loaded config, the capability quarantine).
+    Reinstalling there wraps each patched function a second time: with vLLM
+    0.31's fork start method (engine core forked from the API server, workers
+    from the engine core) setup_graph_extension then ran twice per worker and
+    LOAD failed with "[HOOK] ERROR: Binaries already loaded". So only reset
+    when the parent had not installed the hooks, which leaves _INSTALLED
+    False anyway: the child keeps the parent's state either way.
+    """
+    return
 
 
 os.register_at_fork(after_in_child=_reset_install_state_after_fork)

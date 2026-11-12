@@ -33,6 +33,18 @@ if [ "$ROLE" = shadow ]; then
 else
   EXTRA='{"gms_reconstruction_mode": "load_diff"}'; ENVS=""
 fi
+# F10_ZYGOTE=<sock>: a shadow is forked from the zygote (v031-scripts/zygote/zygote.py, started by zystart.sh with the
+# LOAD shadow's environment) instead of being launched as a new process: same arguments, imports already done.
+if [ -n "$F10_ZYGOTE" ] && [ "$ROLE" = shadow ]; then
+  python3 /results/zy/zyctl.py $F10_ZYGOTE $LOG $ENVS -- serve $M --served-model-name glm --port $PORT --trust-remote-code \
+    --seed 0 --tensor-parallel-size 4 --enable-expert-parallel --max-model-len 40960 --gpu-memory-utilization 0.8 \
+    --num-gpu-blocks-override 5641 --block-size 64 --max-num-batched-tokens 8192 --max-num-seqs 1024 \
+    --enable-prefix-caching --enable-chunked-prefill --disable-custom-all-reduce \
+    --kernel-config '{"enable_flashinfer_autotune": false}' \
+    --load-format gms --worker-cls gpu_memory_service.integrations.vllm.worker.GMSWorker \
+    --model-loader-extra-config "$EXTRA" --compilation-config "{$CC}" > $LOG.zyctl
+  exit 0
+fi
 setsid bash -c "env $ENVS vllm serve $M --served-model-name glm --port $PORT --trust-remote-code --seed 0 \
   --tensor-parallel-size 4 --enable-expert-parallel --max-model-len 40960 --gpu-memory-utilization 0.8 \
   --num-gpu-blocks-override 5641 --block-size 64 --max-num-batched-tokens 8192 --max-num-seqs 1024 \
