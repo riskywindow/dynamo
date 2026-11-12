@@ -9,7 +9,9 @@ export PYTHONPATH=/results/vllm-site:$PYTHONPATH PATH=$HOME/.local/bin:$PATH VLL
   VLLM_ALLREDUCE_USE_FLASHINFER=0 VLLM_SERVER_DEV_MODE=1
 ROLE=$1; PORT=$2; LOG=$3; TOML=$4
 M=/model-cache/hub/models--nvidia--GLM-5.2-NVFP4/snapshots/aec724e8c7b8ee9db3b48c01c320f63f9cdaf8aa
-CC='"cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]'
+# Capture sizes: $F10_SIZES (JSON list) or /results/f10/sizes.txt if present, else the 10-size bring-up list.
+SIZES=${F10_SIZES:-$(cat /results/f10/sizes.txt 2>/dev/null)}; SIZES=${SIZES:-[1, 2, 4, 8, 16, 32, 64, 128, 256, 512]}
+CC="\"cudagraph_mode\": \"FULL_AND_PIECEWISE\", \"cudagraph_capture_sizes\": $SIZES"
 if [ -n "$TOML" ]; then CC="$CC, \"graph_extension_config_path\": \"$TOML\""; else CC="$CC, \"mode\": 0"; fi
 if [ "$ROLE" = shadow ]; then
   EXTRA='{"gms_reconstruction_mode": "load_diff", "gms_read_only": true}'; ENVS="DYN_GMS_FIXED_VA=1 DYN_GMS_SCRATCH_KV_ENABLED=1"

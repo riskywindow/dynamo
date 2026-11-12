@@ -1,0 +1,9 @@
+apiVersion: nvidia.com/v1alpha1
+kind: PodSnapshot
+metadata:
+  name: rp-snap-sbs-snap
+  namespace: <namespace>
+  labels: {app: rp-snap-sbs}
+spec:
+  source:
+    podRef: {name: rp-snap-sbs-source, containers: [main]}

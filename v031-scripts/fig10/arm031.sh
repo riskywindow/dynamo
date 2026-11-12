@@ -8,7 +8,7 @@ N=$1; SH=$2; RATE=$3; DUR=${4:-420}; TE=${5:-120}; O=$F/arms/$N; rm -rf $O; mkdi
 curl -sf -X POST localhost:8000/reset_prefix_cache > /dev/null && echo "prefix cache reset"
 rm -f /tmp/loadgen.stop
 python3 -u $F/loadgen_perchunk.py --url http://127.0.0.1:8000 --model glm --corpus $F/CORPUS.json --rate $RATE \
-  --duration $DUR --seed 20261107 --warmup 2 --out $O/requests.jsonl > $O/loadgen.out 2>&1 &
+  --duration $DUR --seed ${SEED:-20261107} --warmup 2 --out $O/requests.jsonl > $O/loadgen.out 2>&1 &
 LG=$!
 for i in $(seq 600); do [ -f $O/loadgen_start.json ] && break; sleep 0.5; done
 T0=$(python3 -c "import json;print(json.load(open('$O/loadgen_start.json'))['t0'])")
