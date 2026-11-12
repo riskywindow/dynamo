@@ -202,3 +202,25 @@ def test_zero_element_meta_buffers_are_materialized_not_reported():
     assert missing == ["layer.real"]
     assert model.layer.cos_sin_cache.device.type == "cpu"
     assert tuple(model.layer.cos_sin_cache.shape) == (8, 0)
+
+
+def test_writer_publishes_the_identity_taken_before_construction(monkeypatch):
+    """vLLM's DeepSeek-V2 mutates the HF config while constructing/loading, so the
+    writer must publish the fingerprint it took before construction (readers check
+    theirs before constructing); recomputing at publish time broke the match."""
+    from types import SimpleNamespace
+
+    published = {}
+    manager = SimpleNamespace(
+        metadata_list=lambda: [],
+        mappings={0x1000: SimpleNamespace(allocation_id="a0")},
+        metadata_put=lambda key, alloc, off, payload: published.update({key: payload}),
+    )
+    monkeypatch.setattr(load_diff, "identity", lambda *a: {"config_sha256": "after-load"})
+    writer = Model()
+    construct = load_diff.snapshot(writer)
+    _load(writer)
+    load_diff.publish_descriptor(manager, writer, None, None, construct,
+                                 identity_before_construction={"config_sha256": "before"})
+    descriptor = json.loads(published[load_diff.KEY])
+    assert descriptor["identity"] == {"config_sha256": "before"}
