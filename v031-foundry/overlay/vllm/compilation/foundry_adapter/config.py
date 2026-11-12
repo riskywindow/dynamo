@@ -44,6 +44,13 @@ class CUDAGraphExtensionConfig:
     # current runtime.  This is a bring-up fallback; the archive path remains
     # the default.
     recapture_on_load: bool = False
+    # Lean SAVE/LOAD (set the same value on SAVE and LOAD so the allocation
+    # trajectories stay matched):
+    # - skip vLLM's throwaway profiling capture (profile_cudagraph_memory
+    #   returns 0); KV geometry must then be fixed, e.g. num_gpu_blocks_override;
+    # - skip the per-size eager warmup forward before each capture/restore.
+    skip_cudagraph_memory_profile: bool = False
+    skip_capture_warmup: bool = False
     # Scratch space reserved for non-deterministic NCCL allocations.
     # After skip_to_scratch_boundary(), allocations start from
     # base_addr + scratch_space_size.
@@ -81,6 +88,10 @@ class CUDAGraphExtensionConfig:
             scratch_space_size=data.get("scratch_space_size", cls.scratch_space_size),
             weight_cache_size=data.get("weight_cache_size"),
             recapture_on_load=data.get("recapture_on_load", cls.recapture_on_load),
+            skip_cudagraph_memory_profile=bool(
+                data.get("skip_cudagraph_memory_profile", False)
+            ),
+            skip_capture_warmup=bool(data.get("skip_capture_warmup", False)),
         )
 
     @staticmethod

@@ -87,6 +87,37 @@ kubectl $NS exec $P -- bash /results/run_qwen.sh               # native, save, l
 kubectl $NS exec $P -- bash /results/run_glm.sh                # same for GLM-5.2 TP4+EP
 ```
 
+## Step 3: lean LOAD on GMS load-diff shadows (`skip_cudagraph_memory_profile`, `skip_capture_warmup`)
+
+Two Foundry TOML keys, set identically on SAVE and LOAD so the allocation trajectories stay matched
+(`FOUNDRY_TOML_EXTRA` in `v031-scripts/load-diff/foundry_shadow.sh`): `skip_cudagraph_memory_profile` makes
+`profile_cudagraph_memory` return 0 (KV geometry must be fixed, here `num_gpu_blocks_override=5641` + GMS scratch KV
+outside the region); `skip_capture_warmup` drops the per-size eager warmup forward in the V2 capture loop.
+GLM-5.2 NVFP4 TP4+EP, GMS writer -> SAVE shadow -> LOAD shadow -> park -> kill writer -> wake (TP0):
+
+| LOAD shadow | baseline | + skip profile capture | + skip warmups |
+|---|---|---|---|
+| init engine | 20.75 s | 13.28 s | 7.98 s |
+| graph phase (profile capture + restore) | 8 s + 5-6 s | 6 s | 1 s |
+| construct (`LLM()`) | 77.2 s | 66.9 s | 64.0 s |
+| wake | 4.25 s | 4.36 s | 5.03 s |
+
+Native shadow, same config, no Foundry (main branch 508f193438): construct 80.7 s, init engine 26.7 s, capture 9+9 s.
+Correctness (both post-wake generations vs the writer): short prompts 4/4 identical, logprob delta 0; long prompts
+same answer, delta <= 0.30, with the same EOS near-tie at token 6 in one generation as before the change.
+SAVE with both keys: init 21.1 s, capture 11 s.
+
+Forwards still run by a lean LOAD shadow, in order (TP0 timeline, 23:10:40 = weights attached):
+1. `profile_run` (GMS scratch-KV `determine_available_memory`): one forward at `max_num_batched_tokens` = 8192 tokens,
+   attention skipped (MoE + all-reduce run), + dummy sampler; ~3 s.
+2. V2 `warmup_kernels` (`kernel_config.enable_jit_warmup`, default on, no log line): a prefill step of
+   min(max_num_seqs, KV blocks) = 1024 requests x 2 tokens (2048 tokens), then 3 uniform decode steps of 1024 tokens
+   (eager: above the 512 capture limit), + sampling; ~2 s. vLLM keeps it so workspaces are sized before capture.
+3. Graph restore: no forwards (1 s). ~3 s after capture before "init engine" returns, not attributed.
+Removed: the profiling capture (graphs + one warmup each) and 20 per-size warmups (10 PIECEWISE 1..512 + FULL decode).
+The two remaining large collective forwards (8192-token profile, 1024-request JIT warmup) are the next interference
+candidates; replacing profile_run needs the workspace sizing it provides (V2 locks workspaces after capture).
+
 ## Next steps
 
 1. LOAD still runs the eager warmup forward per prefill size and vLLM's memory-profiling capture (~9 s each on GLM).

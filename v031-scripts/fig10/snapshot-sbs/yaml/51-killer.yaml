@@ -1,0 +1,25 @@
+# Root, hostPID, AppArmor-unconfined helper used only to SIGKILL the primary's engine processes. Needed because the
+# agent restores processes AppArmor-unconfined, while `kubectl exec` runs under cri-containerd.apparmor.d (enforce),
+# whose signal rules deny SIGKILL/SIGTERM to unconfined peers (kill -0 is not mediated, so it "works").
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rp-snap-sbs-killer
+  namespace: <namespace>
+  labels: {app: rp-snap-sbs, role: helper}
+spec:
+  restartPolicy: Never
+  activeDeadlineSeconds: 21600
+  priorityClassName: <priority-class>
+  terminationGracePeriodSeconds: 1
+  hostPID: true
+  nodeSelector: {kubernetes.io/hostname: <gpu-node>}
+  tolerations: [{key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}]
+  imagePullSecrets: [{name: <image-pull-secret>}]
+  containers:
+  - name: main
+    image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.6.0
+    command: ["sleep", "21600"]
+    securityContext: {runAsUser: 0, appArmorProfile: {type: Unconfined}}
+    env: [{name: NVIDIA_VISIBLE_DEVICES, value: void}]
+    resources: {requests: {cpu: "1", memory: 1Gi}, limits: {cpu: "2", memory: 2Gi}}

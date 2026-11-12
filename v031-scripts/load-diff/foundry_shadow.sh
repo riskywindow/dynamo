@@ -9,6 +9,8 @@ CC="\"cudagraph_mode\": \"FULL_AND_PIECEWISE\", \"cudagraph_capture_sizes\": $SI
 mkdir -p $W; rm -rf $W/ws; mkdir -p $W/ws
 for m in save load; do
   printf 'mode = "%s"\nworkspace_root = "%s"\nbase_addr = "0x600000000000"\nregion_size = "%s"\nscratch_space_size = "2GB"\n' $m $W/ws $REGION > $W/foundry-$m.toml
+  # Extra TOML keys for both SAVE and LOAD, e.g. FOUNDRY_TOML_EXTRA=$'skip_capture_warmup = true\n'
+  [ -n "$FOUNDRY_TOML_EXTRA" ] && printf '%s\n' "$FOUNDRY_TOML_EXTRA" >> $W/foundry-$m.toml
 done
 wait_for() { for i in $(seq 600); do grep -q "HOLD waiting\|SHUTDOWN_DONE\|Traceback\|Segfault" /results/logs/$1.log 2>/dev/null && break; sleep 2; done
   grep -q "HOLD waiting" /results/logs/$1.log || { echo "FAILED $1"; grep -E "Error|error:" /results/logs/$1.log | grep -v "^\s*$" | tail -6 | cut -c1-400; exit 1; }; }
@@ -26,6 +28,8 @@ wait_for $N-load
 bash $S/cmd.sh $N-load sleep; bash $S/kill_engines.sh $N-writer; bash $S/cmd.sh $N-load wake
 bash $S/cmd.sh $N-load "gen afterwake"; bash $S/cmd.sh $N-load "gen afterwake2"
 for t in save load; do L=/results/logs/$N-$t.log
+  grep -h "TP0" $L | grep -oE "Model loading took [0-9.]+ GiB memory and [0-9.]+ seconds|Graph capturing finished in [0-9]+ secs|lean: skipped profile_cudagraph_memory" | sed "s/^/  $t TP0: /"
+  grep -hoE "init engine \(profile, create kv cache, warmup model\) took [0-9.]+ s" $L | sed "s/^/  $t: /"
   echo "$t: $(grep -m1 -o 'LLM_READY construct_s=[0-9.]*' $L) breakable_saved=$(grep -c 'breakable SAVE' $L) breakable_loaded=$(grep -c 'breakable LOAD' $L) restored=$(grep -c 'restored graph descriptor' $L) $(grep -hm1 -o '\[GMS\] load diff: applied.*owners [0-9]*' $L | cut -c1-60)"
   grep -hoE "\[GMS\] Reserved [0-9]+ MiB VA at 0x[0-9a-f]+" $L | head -2
 done

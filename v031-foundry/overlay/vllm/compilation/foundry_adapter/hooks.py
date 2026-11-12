@@ -361,6 +361,12 @@ def _patch_profile_cudagraph_memory() -> None:
             cfg = rt.get_config()
             if cfg is None or cfg.mode == CUDAGraphExtensionMode.NONE:
                 return _orig(self, *args, **kwargs)
+            if cfg.skip_cudagraph_memory_profile:
+                log.info(
+                    "[foundry] lean: skipped profile_cudagraph_memory (mode=%s)",
+                    cfg.mode.value,
+                )
+                return 0
             mode = cfg.mode
             cfg.mode = CUDAGraphExtensionMode.NONE
             try:

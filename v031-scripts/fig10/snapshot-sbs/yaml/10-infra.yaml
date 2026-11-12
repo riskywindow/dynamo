@@ -1,0 +1,102 @@
+# Infra pod: GMS v1 server (holds the node's 4 GPUs via the device plugin), etcd, NATS, Dynamo frontend.
+# Engine pods (source / restored primary / shadows) share the same 4 GPUs via runtimeClass nvidia +
+# NVIDIA_VISIBLE_DEVICES=all and talk to GMS over UDS in the hostPath dir /tmp/rp-snap-sbs.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rp-snap-sbs-infra
+  namespace: <namespace>
+spec:
+  selector: {app: rp-snap-sbs, role: infra}
+  ports:
+  - {name: etcd, port: 2379}
+  - {name: nats, port: 4222}
+  - {name: http, port: 8000}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rp-snap-sbs-infra
+  namespace: <namespace>
+  labels: {app: rp-snap-sbs, role: infra}
+spec:
+  restartPolicy: Never
+  activeDeadlineSeconds: 21600
+  priorityClassName: <priority-class>
+  terminationGracePeriodSeconds: 5
+  runtimeClassName: nvidia
+  nodeSelector: {kubernetes.io/hostname: <gpu-node>}
+  tolerations: [{key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}]
+  imagePullSecrets: [{name: <image-pull-secret>}]
+  initContainers:
+  - name: setup-shared
+    # CUDA forward-compat user-mode driver (libcuda 615) required by Snapshot's cuda-checkpoint on the
+    # node's 580 kernel driver; same package/URL as the snapshot namespace's cuda-compat-fetch ConfigMap.
+    image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.6.0
+    command: ["/bin/bash", "-c"]
+    args:
+    - |
+      set -eux
+      mkdir -p /shared/gms /shared/compat /shared/locks
+      rm -f /shared/gms/*.sock /shared/locks/failover.lock
+      DEB=cuda-compat-13-4_615.71.10-1ubuntu1_arm64.deb
+      if [ ! -f /shared/compat/usr/local/cuda-13.4/compat/libcuda.so.1 ]; then
+        python3 -c "import urllib.request,sys; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])" \
+          https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/$DEB /tmp/$DEB
+        dpkg -x /tmp/$DEB /shared/compat
+      fi
+      ls -la /shared/compat/usr/local/cuda-13.4/compat/
+      chmod -R a+rwX /shared
+    securityContext: {runAsUser: 0}
+    env: [{name: NVIDIA_VISIBLE_DEVICES, value: void}]
+    volumeMounts: [{name: shared, mountPath: /shared}]
+  containers:
+  - name: gms
+    image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.6.0
+    command: ["/bin/bash", "-c"]
+    args:
+    - |
+      export LD_LIBRARY_PATH=/shared/compat/usr/local/cuda-13.4/compat:$LD_LIBRARY_PATH
+      nvidia-smi -L; nvidia-smi --query-gpu=index,uuid,pci.bus_id,memory.total --format=csv
+      (nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu --format=csv -l 2 > /results/gpumem.csv 2>&1 &)
+      exec python3 -m gpu_memory_service.cli.server
+    env:
+    - {name: DYN_GMS_USE_V1, value: "true"}
+    - {name: GMS_SOCKET_DIR, value: /shared/gms}
+    - {name: CUDA_DEVICE_ORDER, value: PCI_BUS_ID}
+    - {name: NVIDIA_DRIVER_CAPABILITIES, value: "compute,utility"}
+    resources:
+      requests: {cpu: "4", memory: 16Gi, nvidia.com/gpu: "4"}
+      limits: {cpu: "8", memory: 64Gi, nvidia.com/gpu: "4"}
+    volumeMounts:
+    - {name: shared, mountPath: /shared}
+    - {name: results, mountPath: /results}
+  - name: etcd
+    image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.6.0
+    command: ["/usr/local/bin/etcd/etcd", "--data-dir", "/tmp/etcd", "--listen-client-urls", "http://0.0.0.0:2379",
+              "--advertise-client-urls", "http://rp-snap-sbs-infra:2379"]
+    env: [{name: NVIDIA_VISIBLE_DEVICES, value: void}]
+    resources: {requests: {cpu: "1", memory: 2Gi}, limits: {cpu: "2", memory: 4Gi}}
+  - name: nats
+    image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.6.0
+    command: ["/usr/bin/nats-server", "-js", "-p", "4222", "--store_dir", "/tmp/nats"]
+    env: [{name: NVIDIA_VISIBLE_DEVICES, value: void}]
+    resources: {requests: {cpu: "1", memory: 2Gi}, limits: {cpu: "2", memory: 8Gi}}
+  - name: frontend
+    image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.6.0
+    command: ["/bin/bash", "-c"]
+    args:
+    - |
+      until (echo > /dev/tcp/127.0.0.1/2379) 2>/dev/null && (echo > /dev/tcp/127.0.0.1/4222) 2>/dev/null; do sleep 1; done
+      exec python3 -m dynamo.frontend --http-port 8000
+    env:
+    - {name: NVIDIA_VISIBLE_DEVICES, value: void}
+    - {name: ETCD_ENDPOINTS, value: "http://127.0.0.1:2379"}
+    - {name: NATS_SERVER, value: "nats://127.0.0.1:4222"}
+    resources: {requests: {cpu: "8", memory: 16Gi}, limits: {cpu: "16", memory: 32Gi}}
+    volumeMounts: [{name: results, mountPath: /results}]
+  volumes:
+  - name: shared
+    hostPath: {path: /tmp/rp-snap-sbs, type: DirectoryOrCreate}
+  - name: results
+    emptyDir: {}
