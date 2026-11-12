@@ -87,6 +87,10 @@ def cycle(d, ref_offsets=None):
             out["replenish_s"] = round(ev["rep_parked"] - ev["rep_start"], 2)
             out["windows"]["replenish"] = window(reqs, gaps, merged, ev["rep_start"], ev["rep_parked"])
             out["windows"]["post"] = window(reqs, gaps, merged, ev["rep_parked"], t0 + dur)
+        if "pre_start" in ev and "pre_held" in ev:
+            # Gated spare (chain031g.sh): its startup up to the gate runs while the promoted engine serves.
+            out["prestart_s"] = round(ev["pre_held"] - ev["pre_start"], 2)
+            out["windows"]["prestart"] = window(reqs, gaps, merged, ev["pre_start"], ev["pre_held"])
     else:
         out["windows"] = {"pre": window(reqs, gaps, merged, t0 + 30, t0 + 120)}
         if ref_offsets:
@@ -133,6 +137,12 @@ def main():
                   f"{fmt(w.get('itl_p50_ms'), '{:.0f}')+'/'+fmt(w.get('itl_p99_ms'), '{:.0f}'):>15s} {w.get('stalls', 0):>6d} "
                   f"{w.get('stall_s', 0):>7.1f} {w.get('max_stall_s', 0):>5.1f} | "
                   f"{fmt(p.get('ttft_p50'))}/{fmt(p.get('ttft_p90'))}, {fmt(p.get('itl_p50_ms'), '{:.0f}')} | {c['errors']}/{c['truncated']}")
+            q = c["windows"].get("prestart")
+            if q:
+                print(f"{'':10s} {'':4s} {fmt(c.get('prestart_s'), '{:.1f}'):>7s} {'(gated spare prestart)':>9s} | {'':17s} "
+                      f"{q.get('n_req', 0):>3d} {fmt(q.get('ttft_p50'))+'/'+fmt(q.get('ttft_p90')):>13s} "
+                      f"{fmt(q.get('itl_p50_ms'), '{:.0f}')+'/'+fmt(q.get('itl_p99_ms'), '{:.0f}'):>15s} {q.get('stalls', 0):>6d} "
+                      f"{q.get('stall_s', 0):>7.1f} {q.get('max_stall_s', 0):>5.1f}")
 
 
 if __name__ == "__main__":

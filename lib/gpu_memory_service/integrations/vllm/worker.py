@@ -57,6 +57,27 @@ from gpu_memory_service.integrations.vllm.utils import configure_gms_worker_logg
 
 logger = logging.getLogger(__name__)
 
+
+def _wait_at_startup_gate() -> None:
+    """Hold a pre-started spare after weight attach until it is needed.
+
+    With ``DYN_GMS_STARTUP_GATE=<path>`` the worker blocks at the end of
+    load_model (process spawn, imports, NCCL init and the GMS weight attach are
+    done; profiling, KV cache, warmup and graph capture/restore are not) until
+    <path> exists. Every rank waits on the same file. Releasing the gate is the
+    replenishment trigger. Set VLLM_ENGINE_READY_TIMEOUT_S high on gated engines.
+    """
+    path = os.environ.get("DYN_GMS_STARTUP_GATE")
+    if not path:
+        return
+    import time
+
+    t0 = time.monotonic()
+    logger.info("[GMS] startup gate: holding after weight attach until %s exists", path)
+    while not os.path.exists(path):
+        time.sleep(0.02)
+    logger.info("[GMS] startup gate: released after %.1f s", time.monotonic() - t0)
+
 # Make gpu_memory_service INFO/DEBUG visible in the vLLM worker subprocess, where
 # vLLM's logging config would otherwise drop them.
 configure_gms_worker_logging()
@@ -377,6 +398,8 @@ class GMSWorker(_BaseWorker):
                 )
         except Exception as e:
             logger.debug("[GMS] Could not correct memory accounting: %s", e)
+
+        _wait_at_startup_gate()
 
     def sleep(self, level: int = 1) -> None:
         """vLLM sleep implementation with GMS integration.
