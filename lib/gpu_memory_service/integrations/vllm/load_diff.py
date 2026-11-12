@@ -388,11 +388,16 @@ def _routing_digest(module) -> dict | None:
             "sha256": hashlib.sha256(raw.numpy().tobytes()).hexdigest()}
 
 
-def publish_descriptor(manager, model, vllm_config, model_config, construct: dict) -> None:
+def publish_descriptor(manager, model, vllm_config, model_config, construct: dict,
+                       identity_before_construction: dict | None = None) -> None:
+    """``identity_before_construction``: the writer's identity taken before
+    ``initialize_model``. Model construction/loading may mutate the HF config
+    (vLLM's DeepSeek-V2 does), and readers check identity before constructing,
+    so both sides must fingerprint at the same point."""
     final = snapshot(model)
     changed = diff(construct, final)
     descriptor = dict(
-        identity=identity(vllm_config, model_config),
+        identity=identity_before_construction or identity(vllm_config, model_config),
         sources=_source_hashes(_source_modules(model, final)),
         modules={},
         aliases={},

@@ -337,6 +337,11 @@ def _load_write_mode(
     component_mode = component_reconstruction.selected(vllm_config)
     load_diff_mode = load_diff.selected(vllm_config)
     construct_state = None
+    # Fingerprint before construction, where readers check it (construction
+    # can mutate the HF config).
+    load_diff_identity = (
+        load_diff.identity(vllm_config, model_config) if load_diff_mode else None
+    )
     if _pending_gms_client is not None:
         raise RuntimeError("A GMS write is already awaiting publication")
 
@@ -380,7 +385,8 @@ def _load_write_mode(
         )
     if load_diff_mode:
         load_diff.publish_descriptor(
-            gms_client, model, vllm_config, model_config, construct_state
+            gms_client, model, vllm_config, model_config, construct_state,
+            identity_before_construction=load_diff_identity,
         )
     # Metadata for private buffers references an immutable initial-value copy.
     # Keep one source storage owner, including after commit, independently of
