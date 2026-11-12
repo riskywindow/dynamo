@@ -43,3 +43,45 @@ Caveats:
 Reproduce: deploy with `deploy_f10.sh`, fill the bytecode cache (`PYTHONPYCACHEPREFIX=/results/pycache python3 -m
 compileall -q -j 32 <site dirs>`), then `NO_BASE=1 NCYC=2 bash /results/f10/run_combined.sh`. Results:
 `~/load-diff-20261111/results-combined/` (`arms/`, `all.json`, `table.txt`, `run_combined.out`).
+
+## Update 2026-11-12: n=5 (3 more cycles + 2 fresh baselines, same node)
+
+Same node (w0e-...-mb4d, pod rp-ldf-n1), same config, same load. Cycles c3-c5 (seeds 20261309 / 20261410 / 20261511)
+were run with `run_n5.sh` (`K0=3 NCYC=3`; `chain031g.sh` now takes `K0`). Fresh no-failure baselines for seeds c4/c5;
+c1-c3 baselines are the RESULTS_SBS cycles with the same seeds. Analysis: `sbs_analyze.py --ref=combined` over all
+five cycles (`results-combined-n5/table.txt`), plus `windows_vs_baseline.txt` (same-seed baseline at the same
+offsets from t0).
+
+| Cycle | Replenishment (release -> parked) | Kill -> promoted | Kill -> first token | Replenish window: n, TTFT p50/p90 (same-seed baseline) | Stalls >0.5 s (replenish / pre-start) | Pre-start (s): n, TTFT p50/p90 (baseline) | Err / truncated |
+|---|---|---|---|---|---|---|---|
+| c1 | 11.4 s | 6.1 s | 8.8 s | 3, 2.17/3.77 (1.58/1.72) | 0 / 0 | 59.7: 4, 1.32/1.81 (1.30/1.80) | 0 / 5 |
+| c2 | 12.4 s | 5.8 s | 15.2 s | 2, 1.35/2.60 (1.30/1.31) | 0 / 0 | 59.7: 12, 1.71/3.28 (1.88/2.99) | 0 / 10 |
+| c3 | 11.4 s | 6.3 s | 9.2 s | 3, 1.57/1.79 (1.58/1.79) | 0 / 0 | 59.1: 17, 2.17/8.08 (2.11/6.46) | 0 / 3 |
+| c4 | 12.4 s | 5.8 s | 8.6 s | 3, 2.94/4.05 (1.28/1.28) | 0 / 0 | 61.8: 16, 2.20/7.64 (1.54/2.63) | 0 / 8 |
+| c5 | 11.4 s | 5.3 s | 8.0 s | 2, 1.32/3.12 (1.35/1.36) | 0 / 0 | 61.2: 12, 1.35/1.58 (1.32/1.57) | 0 / 2 |
+| **n=5** | **11.4-12.4 s (mean 11.8)** | 5.3-6.3 s | 8.0-15.2 s | | **0 / 0** | 59-62 s | **0** / 2-10 |
+
+Replenishment is bimodal (11.4 or 12.4 s); the difference is in the API-server phase and polling, not in KV/graphs.
+
+Post-release phases (released spares of c3-c5, seconds after `startup gate: released`, ts.py-stamped logs,
+`startup_phases.txt`): KV ready +0.0-0.1, graphs restored +4.8-5.1, engine init done +6.5-6.9, API server serving
++10.8-11.3 s; event-measured release->ready 11.17-12.19 s (gate-file and readiness polling add 0.4-0.9 s), park +0.22 s.
+So the ~11.5 s is ~5 s KV allocation + graph restore, ~1.7 s remaining engine init, ~4.4 s API-server startup after
+the engine is ready, ~0.6 s polling + park. Everything before the gate (spawn, imports, NCCL, weight attach: 55-58 s
+in these logs) is pre-paid while the spare starts during serving.
+
+Correctness, final promoted engine (after c5) vs the primary: solo 4/4, long 2/2 identical (logprob delta 0); pair 3/4
+(diverges at token 8, delta 0.0009 on the matched prefix, a near-tie); batch8 6/8 (concurrent batching). Errors: 0
+in all cycles.
+
+Notes:
+- 0 decode stalls >0.5 s in every replenish window and every spare pre-start window (5/5 cycles).
+- TTFT in the replenish window is above the same-seed baseline in c1/c4 (and c2 p90). These are the first 2-3
+  requests on the just-promoted engine (first-request Triton JIT, ~1 s, RESULTS_NOWARM; plus a prefix cache that is
+  cold relative to the baseline's primary). Not separated in this data.
+- Pre-start window TTFT p90 is above baseline in c3/c4 (8.08 vs 6.46, 7.64 vs 2.63 s) with no decode gaps >0.5 s;
+  c1/c2/c5 match baseline. It overlaps the promoted engine's first minute, so spare pre-start and cold-engine effects
+  are not separated either.
+- Snapshot: the snapshot-agent nodes (o7v xjjk / v6sj) are quarantined (`FAILURE_NVLINK` maintenance pending,
+  SchedulingDisabled), so there is still no matched Snapshot run.
+
