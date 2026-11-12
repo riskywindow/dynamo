@@ -21,6 +21,7 @@ torch.compile off, capture sizes 1..512 (10 sizes), NCCL all-reduce, custom AR o
 | Qwen3.6-35B-A3B-FP8 (text-only) | Qwen3.5-MoE, hybrid linear attention, block FP8 [128,128] | TP4+EP | 0 missing (20 KV-scale placement warnings) | 40 + 36 | 6/6 identical, Δ 0 |
 | Nemotron-3.5-Lightning-30B-A3B | NemotronH hybrid Mamba MoE, BF16 | TP4+EP | 12 CPU tensors restored, 0 missing | decode-only: 36 restored (see note) | 6/6 identical, Δ 0 |
 | GLM-5.3-Flash-NVFP4 (text-only) | Glm5Next DSA, ModelOpt NVFP4 | TP4+EP | 6 values applied (`is_w4a16_nvfp4`), 22 CPU tensors, 0 missing | 40 + 36 | short 4/4 identical Δ 0; long prompts diverge at tokens 14/–, within the writer's own repeat noise (15/5, Δ ≤ 0.73) |
+| DeepSeek-V4.1-Flash-NVFP4 | DeepseekV41, NVFP4 experts (492 GB) | TP4+EP | not reached (see note) | – | – |
 | gpt-oss-120b | GptOss MoE, MXFP4 | TP4+EP | **refused at attach**: `GptOssMxfp4MoEMethod` has no pre-processed-weights path | – | – |
 | GLM-5.2-FP8 (email: "refuses") | GlmMoeDsa, block FP8 | – | not run: 756 GB > ~737 GB HBM of one 4x GB200 node, and not cached | – | – |
 
@@ -43,6 +44,11 @@ Zane's weight cache refused (block-scale repack, DeepGEMM layout) is handled. Th
    - The generic `Mxfp4MoEMethod` in 0.31 has a `weights_already_processed` branch that only rebuilds the kernel (`_build_moe_kernel`).
    - `GptOssMxfp4MoEMethod.process_weights_after_loading` always repacks through `_setup_kernel`, and it doesn't declare `supports_pre_processed_weights`.
    - The same branch is needed there. vLLM's own weight-cache IPC loader refuses it for the same reason.
+
+4. **DeepSeek-V4.1-Flash-NVFP4: no result. This is an infrastructure limit.**
+   - Attempt 1: the writer loaded all weights, then failed vLLM's KV-capacity check at `gpu_memory_utilization` 0.85 (0.26 GiB free vs 0.37 GiB needed).
+   - Attempt 2, at 0.93: the pod was OOM-killed (host memory limit 500 GiB) while the writer loaded the 492 GB checkpoint.
+   - Its logs were lost with the pod. It needs a fresh pod; a larger host-memory limit may also help.
 
 Benign warnings seen:
 - `_k_scale_cpu`/`_v_scale_cpu`: CUDA in the writer vs CPU after the reader's KV-cache rebuild, value 1.0 on both sides.
