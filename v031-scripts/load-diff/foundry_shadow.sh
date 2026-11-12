@@ -3,9 +3,10 @@
 # GMS writer (disk) -> Foundry SAVE shadow (load_diff, fixed VA, scratch KV) -> exit
 # -> Foundry LOAD shadow -> park -> kill writer -> wake -> generate; compare with the writer.
 source /results/scripts/env.sh
-export PYTHONPATH=/results/vllm-site:$PYTHONPATH PATH=$HOME/.local/bin:$PATH VLLM_USE_BREAKABLE_CUDAGRAPH=1 VLLM_ALLREDUCE_USE_FLASHINFER=${VLLM_ALLREDUCE_USE_FLASHINFER:-0}
+export PYTHONPATH=/results/vllm-site:$PYTHONPATH PATH=$HOME/.local/bin:$PATH VLLM_USE_BREAKABLE_CUDAGRAPH=${VLLM_USE_BREAKABLE_CUDAGRAPH:-1} VLLM_ALLREDUCE_USE_FLASHINFER=${VLLM_ALLREDUCE_USE_FLASHINFER:-0}
 N=$1; M=$2; A=$3; BASE=$4; SIZES=$5; REGION=${6:-256GB}; S=/results/scripts; W=/results/ldf/$N
-CC="\"cudagraph_mode\": \"FULL_AND_PIECEWISE\", \"cudagraph_capture_sizes\": $SIZES"
+# CG_MODE=FULL_DECODE_ONLY (with VLLM_USE_BREAKABLE_CUDAGRAPH=0) for models whose breakable prefill graphs are broken
+CC="\"cudagraph_mode\": \"${CG_MODE:-FULL_AND_PIECEWISE}\", \"cudagraph_capture_sizes\": $SIZES"
 mkdir -p $W; rm -rf $W/ws; mkdir -p $W/ws
 for m in save load; do
   printf 'mode = "%s"\nworkspace_root = "%s"\nbase_addr = "0x600000000000"\nregion_size = "%s"\nscratch_space_size = "2GB"\n' $m $W/ws $REGION > $W/foundry-$m.toml
