@@ -388,6 +388,24 @@ def _routing_digest(module) -> dict | None:
             "sha256": hashlib.sha256(raw.numpy().tobytes()).hexdigest()}
 
 
+def descriptor_allocation_id(manager, model) -> str:
+    """An allocation to attach descriptor metadata to that survives publication.
+
+    GMS drops all metadata of an allocation when it is freed, and the writer's
+    pool release can free allocations that only held non-parameter storage
+    (that storage is copied out first). Parameters stay in GMS, so the
+    allocation backing one does too. Not the first mapping: it may be pruned.
+    """
+    spans = sorted((va, va + m.aligned_size, m.allocation_id)
+                   for va, m in manager.mappings.items())
+    for param in model.parameters():
+        ptr = param.data_ptr()
+        for start, end, allocation_id in spans:
+            if start <= ptr < end:
+                return allocation_id
+    raise RuntimeError("No model parameter is backed by a GMS allocation")
+
+
 def publish_descriptor(manager, model, vllm_config, model_config, construct: dict,
                        identity_before_construction: dict | None = None) -> None:
     """``identity_before_construction``: the writer's identity taken before
@@ -424,8 +442,7 @@ def publish_descriptor(manager, model, vllm_config, model_config, construct: dic
             routing=_routing_digest(module),
         )
     payload = json.dumps(descriptor, sort_keys=True).encode()
-    mapping = next(iter(manager.mappings.values()))
-    manager.metadata_put(KEY, mapping.allocation_id, 0, payload)
+    manager.metadata_put(KEY, descriptor_allocation_id(manager, model), 0, payload)
     n_changed = sum(len(r) for r in changed.values())
     logger.info(
         "[GMS] load diff published: %d modules, %d attributes changed by loading "

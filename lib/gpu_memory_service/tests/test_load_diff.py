@@ -224,3 +224,24 @@ def test_writer_publishes_the_identity_taken_before_construction(monkeypatch):
                                  identity_before_construction={"config_sha256": "before"})
     descriptor = json.loads(published[load_diff.KEY])
     assert descriptor["identity"] == {"config_sha256": "before"}
+
+
+def test_descriptor_attaches_to_a_parameter_backed_allocation():
+    """GMS drops an allocation's metadata when it is freed, and the writer's
+    pool release may free the first mapping if it only held non-parameter
+    storage. The descriptor must sit on an allocation a parameter lives in."""
+    from types import SimpleNamespace
+
+    model = Model()
+    param = model.layer.weight
+    buffer_only = torch.zeros(64)
+    mappings = {
+        buffer_only.data_ptr(): SimpleNamespace(aligned_size=buffer_only.nbytes, allocation_id="buf"),
+        param.data_ptr(): SimpleNamespace(aligned_size=param.nbytes, allocation_id="param"),
+    }
+    manager = SimpleNamespace(mappings=mappings)
+    assert next(iter(mappings.values())).allocation_id == "buf"  # the old choice
+    assert load_diff.descriptor_allocation_id(manager, model) == "param"
+
+    with pytest.raises(RuntimeError, match="No model parameter"):
+        load_diff.descriptor_allocation_id(SimpleNamespace(mappings={}), model)

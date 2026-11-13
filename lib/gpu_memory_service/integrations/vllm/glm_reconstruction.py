@@ -337,17 +337,19 @@ def publish_descriptor(manager, model, vllm_config, model_config) -> None:
             },
             routing=_routing_digest(module),
         )
-    mapping = next(iter(manager.mappings.values()))
+    from gpu_memory_service.integrations.vllm.load_diff import descriptor_allocation_id
+
+    allocation_id = descriptor_allocation_id(manager, model)
     manager.metadata_put(
         METADATA_KEY,
-        mapping.allocation_id,
+        allocation_id,
         0,
         json.dumps(descriptor, sort_keys=True).encode(),
     )
     if profile.pre_processed_finalize:
         manager.metadata_put(
             AUDIT_KEY,
-            mapping.allocation_id,
+            allocation_id,
             0,
             json.dumps(_audit(model), sort_keys=True, default=str).encode(),
         )

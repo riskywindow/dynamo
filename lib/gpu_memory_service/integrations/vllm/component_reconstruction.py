@@ -112,8 +112,9 @@ def publish_descriptor(manager, model, vllm_config, model_config):
             "routing": _routing(module),
             "padding": vars(module).get("weights_padding_cols"),
         }
-    mapping = next(iter(manager.mappings.values()))
-    manager.metadata_put(KEY, mapping.allocation_id, 0,
+    from gpu_memory_service.integrations.vllm.load_diff import descriptor_allocation_id
+
+    manager.metadata_put(KEY, descriptor_allocation_id(manager, model), 0,
                          json.dumps(descriptor, sort_keys=True).encode())
 
 
